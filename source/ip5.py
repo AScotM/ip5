@@ -1,9 +1,4 @@
 #!/usr/bin/env python3 -u
-"""
-Simple Network Monitor (Extended & Optimized)
-Author: Sleeper
-Refined with performance, structure, and UX improvements.
-"""
 
 import argparse
 import fcntl
