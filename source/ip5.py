@@ -1,4 +1,9 @@
 #!/usr/bin/env python3 -u
+"""
+Simple Network Monitor (Extended & Optimized)
+Author: Sleeper
+Refined with performance, structure, and UX improvements.
+"""
 
 import argparse
 import fcntl
@@ -55,60 +60,67 @@ def get_mtu(interface: str) -> Optional[int]:
     except (OSError, struct.error):
         return None
 
-def get_addrs(interface: str) -> str:
+def get_ipv4_info(interface: str) -> Optional[str]:
+    """Retrieve IPv4 address and prefix length for an interface."""
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            ifr = struct.pack("16sH14s", interface.encode("utf-8")[:15], socket.AF_INET, b"\x00" * 14)
+            addr_data = fcntl.ioctl(s.fileno(), 0x8915, ifr)
+            ipv4 = socket.inet_ntoa(addr_data[20:24])
+            mask_data = fcntl.ioctl(s.fileno(), 0x891b, ifr)
+            netmask = socket.inet_ntoa(mask_data[20:24])
+            netmask_int = struct.unpack("!I", socket.inet_aton(netmask))[0]
+            prefix = bin(netmask_int).count("1")
+            return f"IPv4: {ipv4}/{prefix}"
+    except OSError:
+        return None
+
+def get_all_ipv6_info() -> Dict[str, List[str]]:
+    """Retrieve all IPv6 global addresses in one subprocess call."""
+    ipv6_map: Dict[str, List[str]] = {}
+    try:
+        proc = subprocess.run(
+            ["ip", "-6", "addr", "show"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+        if proc.returncode != 0 or not proc.stdout:
+            return ipv6_map
+
+        current_iface: Optional[str] = None
+        for line in proc.stdout.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            if line[0].isdigit() and ":" in line:
+                current_iface = line.split(":")[1].strip().split("@")[0]
+                continue
+            if current_iface and "inet6" in line and "scope global" in line:
+                parts = line.split()
+                ipv6_addr, prefix = parts[1].split("/")
+                ipv6_map.setdefault(current_iface, []).append(f"IPv6: {ipv6_addr}/{prefix}")
+
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        pass
+
+    return ipv6_map
+
+def get_addrs(interface: str, ipv6_map: Dict[str, List[str]]) -> str:
     addrs: List[str] = []
 
-    try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        ifr = struct.pack("16sH14s", interface.encode("utf-8")[:15], socket.AF_INET, b"\x00" * 14)
-        addr_data = fcntl.ioctl(s.fileno(), 0x8915, ifr)
-        ipv4 = socket.inet_ntoa(addr_data[20:24])
-
-        mask_data = fcntl.ioctl(s.fileno(), 0x891b, ifr)
-        netmask = socket.inet_ntoa(mask_data[20:24])
-
-        netmask_int = struct.unpack("!I", socket.inet_aton(netmask))[0]
-        prefix = bin(netmask_int).count("1")
-        addrs.append(f"IPv4: {ipv4}/{prefix}")
-    except OSError:
-        pass
-    finally:
-        s.close()
+    ipv4_info = get_ipv4_info(interface)
+    if ipv4_info:
+        addrs.append(ipv4_info)
 
     if safe_interface_name(interface):
-        try:
-            proc = subprocess.run(
-                ["ip", "-6", "addr", "show", "dev", interface],
-                capture_output=True,
-                text=True,
-                timeout=5,
-                check=False,
-            )
-            if proc.returncode == 0 and "inet6" in proc.stdout:
-                for line in proc.stdout.splitlines():
-                    if "inet6" in line and "scope global" in line:
-                        parts = line.strip().split()
-                        ipv6_addr, prefix = parts[1].split("/")
-                        addrs.append(f"IPv6: {ipv6_addr}/{prefix}")
-                        break
-        except FileNotFoundError:
-            addrs.append("IPv6: ip command not found")
-        except subprocess.TimeoutExpired:
-            addrs.append("IPv6: lookup timed out")
+        if ipv6_map.get(interface):
+            addrs.extend(ipv6_map[interface])
     else:
         addrs.append("IPv6: invalid interface name")
 
     return "; ".join(addrs) or "N/A"
-
-def get_interface_info(interface: str) -> None:
-    print(f"{Colors.SEPIA}{interface}:{Colors.RESET}")
-
-    mtu = get_mtu(interface)
-    if mtu:
-        print(f"    MTU: {mtu}")
-
-    addrs = get_addrs(interface)
-    print(f"    Addresses: {addrs}")
 
 class InterfaceTraffic:
     def __init__(self, name: str) -> None:
@@ -191,13 +203,19 @@ def parse_traffic_stats(filter_ifaces: Optional[List[str]] = None) -> Dict[str, 
 
 def display_network_info(filter_ifaces: Optional[List[str]] = None) -> None:
     print(f"{Colors.GREY}Network Interfaces:{Colors.RESET}")
+    ipv6_map = get_all_ipv6_info()
 
     all_ifaces = filter_ifaces or [
         i for i in os.listdir(SYSFS_NET_PATH) if os.path.isdir(f"{SYSFS_NET_PATH}/{i}")
     ]
 
     for iface in sorted(all_ifaces):
-        get_interface_info(iface)
+        print(f"{Colors.SEPIA}{iface}:{Colors.RESET}")
+        mtu = get_mtu(iface)
+        if mtu:
+            print(f"    MTU: {mtu}")
+        addrs = get_addrs(iface, ipv6_map)
+        print(f"    Addresses: {addrs}")
 
 def display_traffic_stats(filter_ifaces: Optional[List[str]] = None) -> None:
     stats = parse_traffic_stats(filter_ifaces)
@@ -216,12 +234,17 @@ def display_traffic_stats(filter_ifaces: Optional[List[str]] = None) -> None:
             f"({tr.tx_packets} pkts, {tr.tx_errs} errs){Colors.RESET}"
         )
 
+def clear_screen() -> None:
+    """Clear the terminal efficiently."""
+    sys.stdout.write("\033[H\033[J")
+    sys.stdout.flush()
+
 def watch_mode(filter_ifaces: Optional[List[str]], interval: float) -> None:
     previous: Dict[str, InterfaceTraffic] = {}
 
     try:
         while True:
-            os.system("clear" if os.name == "posix" else "cls")
+            clear_screen()
             print(f"{Colors.GREY}Live Traffic (refresh: {interval}s){Colors.RESET}\n")
 
             current = parse_traffic_stats(filter_ifaces)
@@ -229,10 +252,8 @@ def watch_mode(filter_ifaces: Optional[List[str]], interval: float) -> None:
             for iface, cur in sorted(current.items()):
                 if iface in previous:
                     prev = previous[iface]
-
                     delta_rx = max(0, cur.rx_bytes - prev.rx_bytes)
                     delta_tx = max(0, cur.tx_bytes - prev.tx_bytes)
-
                     rx_rate = delta_rx / interval
                     tx_rate = delta_tx / interval
 
@@ -260,6 +281,7 @@ def watch_mode(filter_ifaces: Optional[List[str]], interval: float) -> None:
 
 def output_json(filter_ifaces: Optional[List[str]] = None) -> None:
     stats = parse_traffic_stats(filter_ifaces)
+    ipv6_map = get_all_ipv6_info()
     payload: Dict[str, Dict] = {}
 
     for iface, tr in stats.items():
@@ -271,7 +293,7 @@ def output_json(filter_ifaces: Optional[List[str]] = None) -> None:
             "rx_errs": tr.rx_errs,
             "tx_errs": tr.tx_errs,
             "mtu": tr.mtu,
-            "addrs": get_addrs(iface),
+            "addrs": get_addrs(iface, ipv6_map),
         }
 
     print(json.dumps(payload, indent=2))
@@ -279,7 +301,7 @@ def output_json(filter_ifaces: Optional[List[str]] = None) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Simple Network Monitor (Extended)",
-        epilog="Examples: %(prog)s --watch 2 | %(prog)s --json > out.json",
+        epilog="Examples: %(prog)s --watch | %(prog)s --json > out.json",
         formatter_class=argparse.RawTextHelpFormatter,
     )
     parser.add_argument(
@@ -292,9 +314,11 @@ def main() -> None:
     parser.add_argument(
         "--watch",
         "-w",
+        nargs="?",
+        const=1.0,
         type=float,
         metavar="SECONDS",
-        help="Enable live-watch mode; refresh interval in seconds",
+        help="Enable live-watch mode; refresh interval in seconds (default 1s)",
     )
     parser.add_argument(
         "--json",
@@ -320,7 +344,7 @@ def main() -> None:
     try:
         if args.json:
             output_json(iface_filter)
-        elif args.watch:
+        elif args.watch is not None:
             watch_mode(iface_filter, args.watch)
         else:
             display_network_info(iface_filter)
