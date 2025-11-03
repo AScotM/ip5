@@ -11,7 +11,7 @@ import struct
 import subprocess
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
 PROC_NET_DEV = "/proc/net/dev"
@@ -27,7 +27,8 @@ class MonitorConfig:
     show_loopback: bool = True
     show_inactive: bool = False
     precision: int = 1
-    counter_bits: int = 64  # Assume 64-bit counters
+    counter_bits: int = 64
+    units: str = "binary"
 
 
 class Colors:
@@ -38,10 +39,13 @@ class Colors:
     GREEN = "\033[32m"
     YELLOW = "\033[33m"
     BLUE = "\033[34m"
+    CYAN = "\033[36m"
 
     @classmethod
     def disable(cls) -> None:
-        cls.RESET = cls.GREY = cls.SEPIA = cls.RED = cls.GREEN = cls.YELLOW = cls.BLUE = ""
+        for attr in dir(cls):
+            if not attr.startswith('_') and attr.isupper():
+                setattr(cls, attr, "")
 
 
 class SignalHandler:
@@ -54,25 +58,55 @@ class SignalHandler:
         self.shutdown_requested = True
 
 
+@dataclass
+class InterfaceTraffic:
+    name: str
+    rx_bytes: int = 0
+    tx_bytes: int = 0
+    rx_packets: int = 0
+    tx_packets: int = 0
+    rx_errs: int = 0
+    tx_errs: int = 0
+    rx_drop: int = 0
+    tx_drop: int = 0
+    mtu: Optional[int] = None
+    state: str = "unknown"
+    ipv4_addr: Optional[str] = None
+    ipv6_addrs: List[str] = field(default_factory=list)
+
+    @property
+    def is_active(self) -> bool:
+        return self.rx_bytes > 0 or self.tx_bytes > 0 or self.rx_packets > 0 or self.tx_packets > 0
+
+    @property
+    def is_up(self) -> bool:
+        return self.state == "up"
+
+
 class NetworkMonitor:
     def __init__(self, config: MonitorConfig):
         self.config = config
         self._ipv6_cache: Optional[Dict[str, List[str]]] = None
         self._ipv6_cache_time: float = 0
         self._mtu_cache: Dict[str, Optional[int]] = {}
+        self._state_cache: Dict[str, str] = {}
         self._interface_cache: Optional[List[str]] = None
         self._interface_cache_time: float = 0
 
+    def get_divisor(self) -> int:
+        return 1000 if self.config.units == "decimal" else 1024
+
     def format_bytes(self, size: int) -> str:
+        divisor = self.get_divisor()
         unit_idx = 0
         readable = float(size)
-        while readable >= 1024 and unit_idx < len(BYTE_UNITS) - 1:
-            readable /= 1024
+        while readable >= divisor and unit_idx < len(BYTE_UNITS) - 1:
+            readable /= divisor
             unit_idx += 1
         
-        if unit_idx == 0:  # Bytes
+        if unit_idx == 0:
             return f"{readable:.0f}{BYTE_UNITS[unit_idx]}"
-        elif readable < 10:  # Small numbers
+        elif readable < 10:
             return f"{readable:.2f}{BYTE_UNITS[unit_idx]}"
         else:
             return f"{readable:.1f}{BYTE_UNITS[unit_idx]}"
@@ -81,24 +115,38 @@ class NetworkMonitor:
         if bytes_per_sec < 0:
             return "0B/s"
         
+        divisor = self.get_divisor()
         unit_idx = 0
         readable = float(bytes_per_sec)
-        while readable >= 1024 and unit_idx < len(BYTE_UNITS) - 1:
-            readable /= 1024
+        while readable >= divisor and unit_idx < len(BYTE_UNITS) - 1:
+            readable /= divisor
             unit_idx += 1
         
-        if unit_idx == 0:  # Bytes
+        if unit_idx == 0:
             return f"{readable:.0f}{BYTE_UNITS[unit_idx]}/s"
-        elif readable < 10:  # Small numbers
+        elif readable < 10:
             return f"{readable:.2f}{BYTE_UNITS[unit_idx]}/s"
         else:
             return f"{readable:.1f}{BYTE_UNITS[unit_idx]}/s"
 
     def safe_interface_name(self, name: str) -> bool:
-        return all(c.isalnum() or c in ("-", "_", ".") for c in name)
+        return all(c.isalnum() or c in ("-", "_", ".", ":") for c in name)
+
+    def get_interface_state(self, interface: str) -> str:
+        if interface in self._state_cache:
+            return self._state_cache[interface]
+        
+        state_path = f"{SYSFS_NET_PATH}/{interface}/operstate"
+        try:
+            with open(state_path) as f:
+                state = f.read().strip().lower()
+                self._state_cache[interface] = state
+                return state
+        except (OSError, IOError):
+            self._state_cache[interface] = "unknown"
+            return "unknown"
 
     def get_available_interfaces(self) -> List[str]:
-        """Get list of valid network interfaces with caching."""
         now = time.time()
         if (self._interface_cache is not None and 
             (now - self._interface_cache_time) < self.config.cache_ttl):
@@ -109,8 +157,19 @@ class NetworkMonitor:
             for iface in os.listdir(SYSFS_NET_PATH):
                 iface_path = os.path.join(SYSFS_NET_PATH, iface)
                 if (os.path.isdir(iface_path) and 
-                    self.safe_interface_name(iface) and
-                    (self.config.show_loopback or iface != "lo")):
+                    self.safe_interface_name(iface)):
+                    
+                    if not self.config.show_loopback:
+                        if iface == "lo":
+                            continue
+                        carrier_path = f"{SYSFS_NET_PATH}/{iface}/carrier"
+                        try:
+                            with open(carrier_path) as f:
+                                if f.read().strip() == "1":
+                                    continue
+                        except (OSError, IOError):
+                            pass
+                    
                     interfaces.append(iface)
             
             self._interface_cache = sorted(interfaces)
@@ -120,7 +179,6 @@ class NetworkMonitor:
             return []
 
     def validate_interfaces(self, requested_ifaces: Optional[List[str]]) -> List[str]:
-        """Validate and filter requested interfaces."""
         available = self.get_available_interfaces()
         if not requested_ifaces:
             return available
@@ -165,7 +223,7 @@ class NetworkMonitor:
                 mask_data = fcntl.ioctl(s.fileno(), 0x891b, ifr)
                 netmask = socket.inet_ntoa(mask_data[20:24])
                 prefix = bin(struct.unpack("!I", socket.inet_aton(netmask))[0]).count("1")
-                return f"IPv4: {ipv4}/{prefix}"
+                return f"{ipv4}/{prefix}"
         except OSError:
             return None
 
@@ -193,7 +251,7 @@ class NetworkMonitor:
                 if iface and "inet6" in line and "scope global" in line:
                     parts = line.split()
                     addr, prefix = parts[1].split("/")
-                    ipv6_map.setdefault(iface, []).append(f"IPv6: {addr}/{prefix}")
+                    ipv6_map.setdefault(iface, []).append(f"{addr}/{prefix}")
 
         except (FileNotFoundError, subprocess.TimeoutExpired):
             pass
@@ -209,69 +267,36 @@ class NetworkMonitor:
         self._ipv6_cache_time = now
         return self._ipv6_cache
 
-    def get_addrs(self, interface: str) -> str:
-        addrs: List[str] = []
+    def get_interface_addrs(self, interface: str) -> Dict[str, List[str]]:
+        addrs = {"ipv4": [], "ipv6": []}
+        
         ipv4 = self.get_ipv4_info(interface)
         if ipv4:
-            addrs.append(ipv4)
+            addrs["ipv4"].append(ipv4)
         
         ipv6_map = self.get_all_ipv6_info_cached()
         if self.safe_interface_name(interface) and interface in ipv6_map:
-            addrs.extend(ipv6_map[interface])
+            addrs["ipv6"].extend(ipv6_map[interface])
         
-        return "; ".join(addrs) if addrs else "N/A"
+        return addrs
+
+    def format_addrs_string(self, addrs: Dict[str, List[str]]) -> str:
+        parts = []
+        if addrs["ipv4"]:
+            parts.append(f"IPv4: {', '.join(addrs['ipv4'])}")
+        if addrs["ipv6"]:
+            parts.append(f"IPv6: {', '.join(addrs['ipv6'][:2])}")  # Limit IPv6 display
+        return "; ".join(parts) if parts else "N/A"
 
     def calculate_rate(self, current: int, previous: int, interval: float) -> float:
-        """Calculate rate with counter overflow protection."""
         if current >= previous:
             return (current - previous) / interval
         else:
-            # Handle counter wrap-around
             max_count = 2**self.config.counter_bits - 1
             return ((max_count - previous) + current + 1) / interval
 
 
-class InterfaceTraffic:
-    def __init__(self, name: str) -> None:
-        self.name = name
-        self.rx_bytes = 0
-        self.tx_bytes = 0
-        self.rx_packets = 0
-        self.tx_packets = 0
-        self.rx_errs = 0
-        self.tx_errs = 0
-        self.mtu: Optional[int] = None
-
-    def update(self, rx_bytes: int, tx_bytes: int, rx_pkts: int, tx_pkts: int,
-               rx_errs: int, tx_errs: int, mtu: Optional[int]) -> None:
-        self.rx_bytes, self.tx_bytes = rx_bytes, tx_bytes
-        self.rx_packets, self.tx_packets = rx_pkts, tx_pkts
-        self.rx_errs, self.tx_errs = rx_errs, tx_errs
-        self.mtu = mtu
-
-    @property
-    def rx_human(self) -> str:
-        return format_bytes(self.rx_bytes)
-
-    @property
-    def tx_human(self) -> str:
-        return format_bytes(self.tx_bytes)
-
-
-def format_bytes(size: int) -> str:
-    unit_idx = 0
-    readable = float(size)
-    while readable >= 1024 and unit_idx < len(BYTE_UNITS) - 1:
-        readable /= 1024
-        unit_idx += 1
-    return f"{readable:.1f}{BYTE_UNITS[unit_idx]}"
-
-
-def format_rate(bytes_per_sec: int) -> str:
-    return f"{format_bytes(bytes_per_sec)}/s"
-
-
-def parse_traffic_stats(monitor: NetworkMonitor, filter_ifaces: Optional[List[str]] = None) -> Dict[str, InterfaceTraffic]:
+def parse_proc_net_dev(monitor: NetworkMonitor, filter_ifaces: Optional[List[str]] = None) -> Dict[str, InterfaceTraffic]:
     stats: Dict[str, InterfaceTraffic] = {}
     if not os.path.exists(PROC_NET_DEV):
         return stats
@@ -287,29 +312,50 @@ def parse_traffic_stats(monitor: NetworkMonitor, filter_ifaces: Optional[List[st
     
     for line in lines:
         parts = line.split()
-        if len(parts) < 12:
+        if len(parts) < 17:
             continue
+            
         iface = parts[0].rstrip(":")
         if valid_ifaces and iface not in valid_ifaces:
             continue
+            
         try:
-            rx_bytes, rx_pkts, rx_errs = int(parts[1]), int(parts[2]), int(parts[3])
-            tx_bytes, tx_pkts, tx_errs = int(parts[9]), int(parts[10]), int(parts[11])
-        except ValueError:
+            rx_bytes = int(parts[1])
+            rx_packets = int(parts[2])
+            rx_errs = int(parts[3])
+            rx_drop = int(parts[4])
+            tx_bytes = int(parts[9])
+            tx_packets = int(parts[10])
+            tx_errs = int(parts[11])
+            tx_drop = int(parts[12])
+        except (ValueError, IndexError):
             continue
         
-        # Skip inactive interfaces if configured
-        if (not monitor.config.show_inactive and 
-            rx_bytes == 0 and tx_bytes == 0 and 
-            rx_pkts == 0 and tx_pkts == 0):
+        if not monitor.config.show_inactive and rx_bytes == 0 and tx_bytes == 0:
             continue
             
-        tr = InterfaceTraffic(iface)
-        tr.update(rx_bytes, tx_bytes, rx_pkts, tx_pkts, rx_errs, tx_errs, 
-                 monitor.get_mtu_cached(iface))
-        stats[iface] = tr
+        state = monitor.get_interface_state(iface)
+        addrs = monitor.get_interface_addrs(iface)
+        mtu = monitor.get_mtu_cached(iface)
         
-        # Limit number of interfaces
+        traffic = InterfaceTraffic(
+            name=iface,
+            rx_bytes=rx_bytes,
+            tx_bytes=tx_bytes,
+            rx_packets=rx_packets,
+            tx_packets=tx_packets,
+            rx_errs=rx_errs,
+            tx_errs=tx_errs,
+            rx_drop=rx_drop,
+            tx_drop=tx_drop,
+            mtu=mtu,
+            state=state,
+            ipv4_addr=addrs["ipv4"][0] if addrs["ipv4"] else None,
+            ipv6_addrs=addrs["ipv6"]
+        )
+        
+        stats[iface] = traffic
+        
         if len(stats) >= monitor.config.max_interfaces:
             break
             
@@ -317,28 +363,35 @@ def parse_traffic_stats(monitor: NetworkMonitor, filter_ifaces: Optional[List[st
 
 
 def display_network_info(monitor: NetworkMonitor, filter_ifaces: Optional[List[str]] = None) -> None:
-    print(f"{Colors.BLUE}Network Interfaces:{Colors.RESET}")
+    print(f"{Colors.BLUE}Network Interface Information:{Colors.RESET}")
     valid_ifaces = monitor.validate_interfaces(filter_ifaces)
     
     for iface in valid_ifaces:
-        print(f"{Colors.SEPIA}{iface}:{Colors.RESET}")
+        state = monitor.get_interface_state(iface)
+        state_color = Colors.GREEN if state == "up" else Colors.RED
         mtu = monitor.get_mtu_cached(iface)
+        addrs = monitor.get_interface_addrs(iface)
+        
+        print(f"\n{Colors.SEPIA}{iface}{Colors.RESET} [{state_color}{state}{Colors.RESET}]")
         if mtu:
-            print(f"    MTU: {mtu}")
-        print(f"    Addresses: {monitor.get_addrs(iface)}")
+            print(f"  MTU: {mtu}")
+        print(f"  Addresses: {monitor.format_addrs_string(addrs)}")
 
 
 def display_traffic_stats(monitor: NetworkMonitor, filter_ifaces: Optional[List[str]] = None) -> None:
-    stats = parse_traffic_stats(monitor, filter_ifaces)
+    stats = parse_proc_net_dev(monitor, filter_ifaces)
     if not stats:
         print(f"{Colors.GREY}No traffic statistics available.{Colors.RESET}")
         return
         
     print(f"{Colors.BLUE}\nTraffic Statistics:{Colors.RESET}")
-    for iface, tr in sorted(stats.items()):
-        print(f"{Colors.SEPIA}{iface:<12}:{Colors.RESET}")
-        print(f"    RX: {Colors.GREEN}{tr.rx_human} {Colors.GREY}({tr.rx_packets} pkts, {tr.rx_errs} errs){Colors.RESET}")
-        print(f"    TX: {Colors.YELLOW}{tr.tx_human} {Colors.GREY}({tr.tx_packets} pkts, {tr.tx_errs} errs){Colors.RESET}")
+    for iface, traffic in sorted(stats.items()):
+        state_color = Colors.GREEN if traffic.is_up else Colors.RED
+        print(f"\n{Colors.SEPIA}{iface:<12}{Colors.RESET} [{state_color}{traffic.state}{Colors.RESET}]")
+        print(f"  RX: {Colors.GREEN}{monitor.format_bytes(traffic.rx_bytes):<10}{Colors.RESET} "
+              f"{Colors.GREY}({traffic.rx_packets} pkts, {traffic.rx_errs} errs, {traffic.rx_drop} drop){Colors.RESET}")
+        print(f"  TX: {Colors.YELLOW}{monitor.format_bytes(traffic.tx_bytes):<10}{Colors.RESET} "
+              f"{Colors.GREY}({traffic.tx_packets} pkts, {traffic.tx_errs} errs, {traffic.tx_drop} drop){Colors.RESET}")
 
 
 def clear_screen() -> None:
@@ -358,12 +411,14 @@ def watch_mode_improved(monitor: NetworkMonitor, filter_ifaces: Optional[List[st
             current_time = time.time()
             elapsed_total = current_time - start_time
             
-            print(f"{Colors.BLUE}Live Traffic - Interval: {interval}s - Uptime: {elapsed_total:.0f}s - Updates: {update_count}{Colors.RESET}\n")
+            print(f"{Colors.BLUE}Live Network Traffic Monitor{Colors.RESET}")
+            print(f"{Colors.GREY}Interval: {interval}s | Uptime: {elapsed_total:.0f}s | Updates: {update_count}{Colors.RESET}\n")
             
-            curr_stats = parse_traffic_stats(monitor, filter_ifaces)
+            curr_stats = parse_proc_net_dev(monitor, filter_ifaces)
             
             for iface, now in sorted(curr_stats.items()):
-                line_parts = [f"{Colors.SEPIA}{iface:<12}:{Colors.RESET}"]
+                state_color = Colors.GREEN if now.is_up else Colors.RED
+                line_parts = [f"{Colors.SEPIA}{iface:<12}{Colors.RESET} [{state_color}{now.state}{Colors.RESET}]"]
                 
                 if iface in prev_stats:
                     old = prev_stats[iface]
@@ -373,26 +428,26 @@ def watch_mode_improved(monitor: NetworkMonitor, filter_ifaces: Optional[List[st
                     line_parts.extend([
                         f"RX {Colors.GREEN}{monitor.format_rate_precise(rx_rate):<12}{Colors.RESET}",
                         f"TX {Colors.YELLOW}{monitor.format_rate_precise(tx_rate):<12}{Colors.RESET}",
-                        f"Total: RX{monitor.format_bytes(now.rx_bytes)} TX{monitor.format_bytes(now.tx_bytes)}"
+                        f"Total: {Colors.CYAN}RX{monitor.format_bytes(now.rx_bytes)} TX{monitor.format_bytes(now.tx_bytes)}{Colors.RESET}"
                     ])
                 else:
                     line_parts.extend([
-                        f"RX {Colors.GREEN}{now.rx_human:<12}{Colors.RESET}",
-                        f"TX {Colors.YELLOW}{now.tx_human:<12}{Colors.RESET}",
+                        f"RX {Colors.GREEN}{monitor.format_bytes(now.rx_bytes):<12}{Colors.RESET}",
+                        f"TX {Colors.YELLOW}{monitor.format_bytes(now.tx_bytes):<12}{Colors.RESET}",
                         f"{Colors.GREY}(initial){Colors.RESET}"
                     ])
                 
                 print(" ".join(line_parts))
             
             if not curr_stats:
-                print(f"{Colors.GREY}No interfaces to monitor.{Colors.RESET}")
+                print(f"{Colors.GREY}No active interfaces to monitor.{Colors.RESET}")
             
-            print(f"\n{Colors.GREY}[Ctrl+C to stop] | Interfaces: {len(curr_stats)} | {time.strftime('%H:%M:%S')}{Colors.RESET}")
+            active_count = sum(1 for traffic in curr_stats.values() if traffic.is_active)
+            print(f"\n{Colors.GREY}[Ctrl+C to stop] | Interfaces: {len(curr_stats)} (active: {active_count}) | {time.strftime('%H:%M:%S')}{Colors.RESET}")
             
             prev_stats = curr_stats
             update_count += 1
             
-            # Sleep with shutdown check
             sleep_remaining = interval
             while sleep_remaining > 0 and not signal_handler.shutdown_requested:
                 time.sleep(min(0.1, sleep_remaining))
@@ -405,77 +460,85 @@ def watch_mode_improved(monitor: NetworkMonitor, filter_ifaces: Optional[List[st
 
 
 def output_json(monitor: NetworkMonitor, filter_ifaces: Optional[List[str]] = None) -> None:
-    stats = parse_traffic_stats(monitor, filter_ifaces)
+    stats = parse_proc_net_dev(monitor, filter_ifaces)
     payload = {
         iface: {
-            "rx_bytes": tr.rx_bytes,
-            "tx_bytes": tr.tx_bytes,
-            "rx_packets": tr.rx_packets,
-            "tx_packets": tr.tx_packets,
-            "rx_errs": tr.rx_errs,
-            "tx_errs": tr.tx_errs,
-            "mtu": tr.mtu,
-            "addrs": monitor.get_addrs(iface),
+            "rx_bytes": traffic.rx_bytes,
+            "tx_bytes": traffic.tx_bytes,
+            "rx_packets": traffic.rx_packets,
+            "tx_packets": traffic.tx_packets,
+            "rx_errs": traffic.rx_errs,
+            "tx_errs": traffic.tx_errs,
+            "rx_drop": traffic.rx_drop,
+            "tx_drop": traffic.tx_drop,
+            "mtu": traffic.mtu,
+            "state": traffic.state,
+            "ipv4_addr": traffic.ipv4_addr,
+            "ipv6_addrs": traffic.ipv6_addrs,
+            "is_active": traffic.is_active,
+            "is_up": traffic.is_up,
         }
-        for iface, tr in stats.items()
+        for iface, traffic in stats.items()
     }
     print(json.dumps(payload, indent=2))
 
 
 @contextlib.contextmanager
 def resource_cleanup():
-    """Context manager for resource cleanup."""
     try:
         yield
     finally:
-        # Cleanup code if needed
         pass
 
 
 def main() -> None:
     config = MonitorConfig()
     
-    p = argparse.ArgumentParser(
+    parser = argparse.ArgumentParser(
         description="Enhanced Network Monitor",
-        epilog="Examples: %(prog)s --watch | %(prog)s --json > out.json",
+        epilog="Examples:\n  %(prog)s --watch\n  %(prog)s --json > out.json\n  %(prog)s -i eth0 wlan0 --watch",
         formatter_class=argparse.RawTextHelpFormatter,
     )
-    p.add_argument("-i", "--interfaces", nargs="*", help="Limit output to given interfaces")
-    p.add_argument("-w", "--watch", nargs="?", const=1.0, type=float,
-                   help="Watch mode with optional refresh interval (default 1s)")
-    p.add_argument("--json", action="store_true", help="Produce JSON output")
-    p.add_argument("--no-color", action="store_true", help="Disable ANSI colors")
-    p.add_argument("--show-inactive", action="store_true", help="Show inactive interfaces")
-    p.add_argument("--hide-loopback", action="store_true", help="Hide loopback interface")
-    p.add_argument("--interval", type=float, default=1.0, help="Polling interval in seconds")
-    p.add_argument("--cache-ttl", type=float, default=5.0, help="Cache TTL in seconds")
+    parser.add_argument("-i", "--interfaces", nargs="*", help="Limit output to given interfaces")
+    parser.add_argument("-w", "--watch", nargs="?", const=1.0, type=float,
+                       help="Watch mode with optional refresh interval (default 1s)")
+    parser.add_argument("--json", action="store_true", help="Produce JSON output")
+    parser.add_argument("--no-color", action="store_true", help="Disable ANSI colors")
+    parser.add_argument("--show-inactive", action="store_true", help="Show inactive interfaces")
+    parser.add_argument("--hide-loopback", action="store_true", help="Hide loopback interface")
+    parser.add_argument("--interval", type=float, default=1.0, help="Polling interval in seconds")
+    parser.add_argument("--cache-ttl", type=float, default=5.0, help="Cache TTL in seconds")
+    parser.add_argument("--max-interfaces", type=int, default=100, help="Maximum interfaces to display")
+    parser.add_argument("--units", choices=["binary", "decimal"], default="binary", 
+                       help="Display units (binary: KiB/MiB, decimal: KB/MB)")
     
-    a = p.parse_args()
+    args = parser.parse_args()
 
     if not sys.platform.startswith("linux"):
-        print(f"{Colors.RED}Error: Linux only.{Colors.RESET}")
+        print(f"{Colors.RED}Error: This tool only works on Linux systems.{Colors.RESET}")
         sys.exit(1)
         
-    if a.no_color:
+    if args.no_color:
         Colors.disable()
 
-    # Update config from arguments
-    config.interval = a.interval
-    config.cache_ttl = a.cache_ttl
-    config.show_loopback = not a.hide_loopback
-    config.show_inactive = a.show_inactive
+    config.interval = args.interval
+    config.cache_ttl = args.cache_ttl
+    config.max_interfaces = args.max_interfaces
+    config.show_loopback = not args.hide_loopback
+    config.show_inactive = args.show_inactive
+    config.units = args.units
 
     monitor = NetworkMonitor(config)
 
     with resource_cleanup():
         try:
-            if a.json:
-                output_json(monitor, a.interfaces)
-            elif a.watch is not None:
-                watch_mode_improved(monitor, a.interfaces, a.watch)
+            if args.json:
+                output_json(monitor, args.interfaces)
+            elif args.watch is not None:
+                watch_mode_improved(monitor, args.interfaces, args.watch)
             else:
-                display_network_info(monitor, a.interfaces)
-                display_traffic_stats(monitor, a.interfaces)
+                display_network_info(monitor, args.interfaces)
+                display_traffic_stats(monitor, args.interfaces)
         except KeyboardInterrupt:
             print(f"\n{Colors.RED}Interrupted.{Colors.RESET}")
             sys.exit(130)
