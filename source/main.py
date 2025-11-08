@@ -11,7 +11,6 @@ import struct
 import subprocess
 import sys
 import time
-import shlex
 import threading
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -64,17 +63,25 @@ class SignalHandler:
     def __init__(self):
         self.shutdown_requested = False
         self.original_handlers = {}
+        self._lock = threading.Lock()
+        
         for sig in [signal.SIGINT, signal.SIGTERM]:
-            self.original_handlers[sig] = signal.getsignal(sig)
-        signal.signal(signal.SIGINT, self._signal_handler)
-        signal.signal(signal.SIGTERM, self._signal_handler)
+            try:
+                self.original_handlers[sig] = signal.getsignal(sig)
+                signal.signal(sig, self._signal_handler)
+            except (ValueError, OSError):
+                pass
     
     def _signal_handler(self, signum: int, frame) -> None:
-        self.shutdown_requested = True
+        with self._lock:
+            self.shutdown_requested = True
         
     def restore_handlers(self):
         for signum, handler in self.original_handlers.items():
-            signal.signal(signum, handler)
+            try:
+                signal.signal(signum, handler)
+            except (ValueError, OSError):
+                pass
 
 
 @dataclass
@@ -138,6 +145,8 @@ def validate_config(config: MonitorConfig) -> List[str]:
         errors.append("Cache TTL must be positive")
     if config.units not in ["binary", "decimal"]:
         errors.append("Units must be 'binary' or 'decimal'")
+    if config.counter_bits not in [32, 64]:
+        errors.append("Counter bits must be 32 or 64")
     return errors
 
 
@@ -164,7 +173,8 @@ class NetworkMonitor:
         
     def cleanup(self):
         with self._lock:
-            self._ipv6_cache.clear()
+            if self._ipv6_cache is not None:
+                self._ipv6_cache.clear()
             self._mtu_cache.clear()
             self._state_cache.clear()
             self._speed_cache.clear()
@@ -217,23 +227,31 @@ class NetworkMonitor:
             return f"{readable:.1f}{units[unit_idx]}/s"
 
     def safe_interface_name(self, name: str) -> bool:
-        if not name or any(c in name for c in ['/', '\\', '..']):
+        if not name or not isinstance(name, str):
             return False
-        return all(c.isalnum() or c in ("-", "_", ".", ":") for c in name)
+        if any(c in name for c in ['/', '\\', '..', '\0']):
+            return False
+        return all(c.isalnum() or c in ("-", "_", ".", ":") for c in name) and len(name) <= 64
+
+    @with_retry(max_attempts=3)
+    def _read_sysfs_file(self, interface: str, filename: str) -> Optional[str]:
+        if not self.safe_interface_name(interface) or not self.safe_interface_name(filename):
+            return None
+        
+        file_path = os.path.join(SYSFS_NET_PATH, interface, filename)
+        
+        if not file_path.startswith(SYSFS_NET_PATH):
+            return None
+            
+        try:
+            with open(file_path, 'r') as f:
+                return f.read().strip()
+        except (OSError, IOError, PermissionError):
+            return None
 
     def _read_interface_state(self, interface: str) -> str:
-        if not self.safe_interface_name(interface):
-            return "unknown"
-        
-        state_path = os.path.join(SYSFS_NET_PATH, interface, "operstate")
-        if not state_path.startswith(SYSFS_NET_PATH):
-            return "unknown"
-        
-        try:
-            with open(state_path) as f:
-                return f.read().strip().lower()
-        except (OSError, IOError):
-            return "unknown"
+        state = self._read_sysfs_file(interface, "operstate")
+        return state.lower() if state else "unknown"
 
     def get_interface_state(self, interface: str) -> str:
         with self._lock:
@@ -247,18 +265,13 @@ class NetworkMonitor:
             return state
 
     def _read_interface_speed(self, interface: str) -> Optional[int]:
-        if not self.safe_interface_name(interface):
-            return None
-        
-        speed_path = os.path.join(SYSFS_NET_PATH, interface, "speed")
-        if not speed_path.startswith(SYSFS_NET_PATH):
-            return None
-        
-        try:
-            with open(speed_path) as f:
-                return int(f.read().strip())
-        except (OSError, ValueError):
-            return None
+        speed_str = self._read_sysfs_file(interface, "speed")
+        if speed_str:
+            try:
+                return int(speed_str)
+            except ValueError:
+                pass
+        return None
 
     def get_interface_speed(self, interface: str) -> Optional[int]:
         with self._lock:
@@ -272,18 +285,8 @@ class NetworkMonitor:
             return speed
 
     def _read_interface_duplex(self, interface: str) -> Optional[str]:
-        if not self.safe_interface_name(interface):
-            return None
-        
-        duplex_path = os.path.join(SYSFS_NET_PATH, interface, "duplex")
-        if not duplex_path.startswith(SYSFS_NET_PATH):
-            return None
-        
-        try:
-            with open(duplex_path) as f:
-                return f.read().strip().lower()
-        except (OSError, IOError):
-            return None
+        duplex = self._read_sysfs_file(interface, "duplex")
+        return duplex.lower() if duplex else None
 
     def get_interface_duplex(self, interface: str) -> Optional[str]:
         with self._lock:
@@ -345,11 +348,10 @@ class NetworkMonitor:
             return None
             
         try:
-            mtu_path = os.path.join(SYSFS_NET_PATH, interface, "mtu")
-            if mtu_path.startswith(SYSFS_NET_PATH):
-                with open(mtu_path) as f:
-                    return int(f.read().strip())
-        except (OSError, ValueError):
+            mtu_str = self._read_sysfs_file(interface, "mtu")
+            if mtu_str:
+                return int(mtu_str)
+        except ValueError:
             pass
 
         try:
@@ -377,14 +379,20 @@ class NetworkMonitor:
             
         try:
             with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
-                ifr = struct.pack("16sH14s", interface.encode("utf-8")[:15], socket.AF_INET, b"\x00" * 14)
-                addr_data = fcntl.ioctl(s.fileno(), 0x8915, ifr)
-                ipv4 = socket.inet_ntoa(addr_data[20:24])
-                mask_data = fcntl.ioctl(s.fileno(), 0x891b, ifr)
-                netmask = socket.inet_ntoa(mask_data[20:24])
-                prefix = bin(struct.unpack("!I", socket.inet_aton(netmask))[0]).count("1")
-                return f"{ipv4}/{prefix}"
-        except OSError:
+                ifr = struct.pack('16sH14s', interface.encode('utf-8')[:15], socket.AF_INET, b'\x00'*14)
+                try:
+                    result = fcntl.ioctl(s.fileno(), 0x8915, ifr)
+                    ip_addr = socket.inet_ntoa(result[20:24])
+                    
+                    result = fcntl.ioctl(s.fileno(), 0x891b, ifr)
+                    netmask = socket.inet_ntoa(result[20:24])
+                    prefix = sum(bin(int(x)).count('1') for x in netmask.split('.'))
+                    
+                    return f"{ip_addr}/{prefix}"
+                except OSError:
+                    return None
+                
+        except Exception:
             return None
 
     def _get_all_ipv6_info_uncached(self) -> Dict[str, List[str]]:
@@ -460,11 +468,19 @@ class NetworkMonitor:
         return "; ".join(parts) if parts else "No addresses"
 
     def calculate_rate(self, current: int, previous: int, interval: float) -> float:
-        if current >= previous:
-            return (current - previous) / interval
-        else:
-            max_count = 2**self.config.counter_bits - 1
-            return ((max_count - previous) + current + 1) / interval
+        if interval <= 0:
+            return 0.0
+            
+        try:
+            if current >= previous:
+                return (current - previous) / interval
+            else:
+                max_count = 2**self.config.counter_bits - 1
+                if max_count <= 0:
+                    max_count = 2**64 - 1
+                return ((max_count - previous) + current + 1) / interval
+        except (ZeroDivisionError, OverflowError):
+            return 0.0
 
     def update_rate_history(self, interface: str, rx_rate: float, tx_rate: float):
         with self._lock:
@@ -473,8 +489,16 @@ class NetworkMonitor:
             
             self._rate_history[interface].append((rx_rate, tx_rate))
             
-            if len(self._rate_history[interface]) > 60:
-                self._rate_history[interface].pop(0)
+            max_history = 60
+            if len(self._rate_history[interface]) > max_history:
+                self._rate_history[interface] = self._rate_history[interface][-max_history:]
+            
+            if len(self._rate_history) > 100:
+                current_ifaces = set(self.get_available_interfaces())
+                stale_ifaces = set(self._rate_history.keys()) - current_ifaces
+                for stale in stale_ifaces:
+                    if stale in self._rate_history:
+                        del self._rate_history[stale]
 
     def get_avg_rates(self, interface: str) -> Tuple[float, float]:
         with self._lock:
@@ -729,8 +753,9 @@ def watch_mode_improved(monitor: NetworkMonitor, filter_ifaces: Optional[List[st
 def output_json(monitor: NetworkMonitor, filter_ifaces: Optional[List[str]] = None) -> None:
     try:
         stats = parse_proc_net_dev(monitor, filter_ifaces)
-        payload = {
-            iface: {
+        payload = {}
+        for iface, traffic in stats.items():
+            payload[iface] = {
                 "rx_bytes": traffic.rx_bytes,
                 "tx_bytes": traffic.tx_bytes,
                 "rx_packets": traffic.rx_packets,
@@ -750,12 +775,12 @@ def output_json(monitor: NetworkMonitor, filter_ifaces: Optional[List[str]] = No
                 "total_bytes": traffic.total_bytes,
                 "total_packets": traffic.total_packets,
             }
-            for iface, traffic in stats.items()
-        }
-        json.dumps(payload, indent=2)
-        print(json.dumps(payload, indent=2))
-    except (TypeError, ValueError) as e:
-        print(f'{{"error": "Failed to generate JSON: {e}"}}', file=sys.stderr)
+        
+        json_str = json.dumps(payload, indent=2)
+        print(json_str)
+        
+    except (TypeError, ValueError, OverflowError) as e:
+        print(f'{{"error": "Failed to generate JSON: {str(e)}"}}', file=sys.stderr)
         sys.exit(1)
 
 
