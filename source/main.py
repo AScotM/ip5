@@ -26,6 +26,7 @@ PROC_NET_DEV = "/proc/net/dev"
 SYSFS_NET_PATH = "/sys/class/net"
 BYTE_UNITS = ["B", "KiB", "MiB", "GiB", "TiB"]
 DEFAULT_UNITS = ["B", "KB", "MB", "GB", "TB"]
+MAX_FILE_SIZE = 8192
 
 
 @dataclass
@@ -267,6 +268,38 @@ class NetworkMonitor:
             return False
         return all(c.isalnum() or c in ("-", "_", ".", ":") for c in name) and len(name) <= 64
 
+    def validate_sysfs_path(self, file_path: str) -> bool:
+        try:
+            normalized_path = os.path.normpath(file_path)
+            if not normalized_path.startswith(SYSFS_NET_PATH):
+                return False
+            
+            relative_path = os.path.relpath(normalized_path, SYSFS_NET_PATH)
+            if relative_path.startswith('..') or os.path.isabs(relative_path):
+                return False
+            
+            path_parts = relative_path.split(os.sep)
+            if len(path_parts) < 1:
+                return False
+            
+            iface_name = path_parts[0]
+            if not self.safe_interface_name(iface_name):
+                return False
+            
+            if len(path_parts) > 1:
+                filename = path_parts[1]
+                allowed_files = [
+                    'tx_bytes', 'rx_bytes', 'tx_packets', 'rx_packets',
+                    'tx_errors', 'rx_errors', 'tx_dropped', 'rx_dropped',
+                    'operstate', 'carrier', 'speed', 'mtu', 'duplex'
+                ]
+                if filename not in allowed_files:
+                    return False
+            
+            return True
+        except (ValueError, OSError):
+            return False
+
     @with_retry(max_attempts=3)
     def _read_sysfs_file(self, interface: str, filename: str) -> Optional[str]:
         if not self.safe_interface_name(interface) or not self.safe_interface_name(filename):
@@ -274,10 +307,14 @@ class NetworkMonitor:
         
         file_path = os.path.join(SYSFS_NET_PATH, interface, filename)
         
-        if not file_path.startswith(SYSFS_NET_PATH):
+        if not self.validate_sysfs_path(file_path):
             return None
-            
+        
         try:
+            file_size = os.path.getsize(file_path)
+            if file_size > MAX_FILE_SIZE:
+                return None
+                
             with open(file_path, 'r') as f:
                 return f.read().strip()
         except (OSError, IOError, PermissionError, FileNotFoundError):
@@ -581,6 +618,10 @@ class NetworkMonitor:
 def read_proc_net_dev_safe(max_lines: int = 1000) -> List[str]:
     lines = []
     try:
+        file_size = os.path.getsize(PROC_NET_DEV)
+        if file_size > MAX_FILE_SIZE * 10:
+            return lines
+            
         with open(PROC_NET_DEV, 'r') as f:
             for i, line in enumerate(f):
                 if i >= max_lines:
