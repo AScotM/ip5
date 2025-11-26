@@ -27,6 +27,8 @@ SYSFS_NET_PATH = "/sys/class/net"
 BYTE_UNITS = ["B", "KiB", "MiB", "GiB", "TiB"]
 DEFAULT_UNITS = ["B", "KB", "MB", "GB", "TB"]
 MAX_FILE_SIZE = 8192
+MAX_CACHE_SIZE = 1000
+MAX_HISTORY_SIZE = 1000
 
 
 @dataclass
@@ -181,17 +183,52 @@ def validate_config(config: MonitorConfig) -> List[str]:
     return errors
 
 
+class LRUCache:
+    def __init__(self, max_size: int = 1000):
+        self.max_size = max_size
+        self.cache: Dict[str, Tuple[object, float]] = {}
+        self._lock = threading.Lock()
+    
+    def get(self, key: str) -> Optional[object]:
+        with self._lock:
+            if key in self.cache:
+                value, timestamp = self.cache[key]
+                # Move to end (most recently used)
+                del self.cache[key]
+                self.cache[key] = (value, timestamp)
+                return value
+        return None
+    
+    def set(self, key: str, value: object, timestamp: float = None):
+        if timestamp is None:
+            timestamp = time.time()
+        with self._lock:
+            if key in self.cache:
+                del self.cache[key]
+            elif len(self.cache) >= self.max_size:
+                # Remove least recently used
+                oldest_key = next(iter(self.cache))
+                del self.cache[oldest_key]
+            self.cache[key] = (value, timestamp)
+    
+    def cleanup_old(self, max_age: float):
+        cutoff = time.time() - max_age
+        with self._lock:
+            keys_to_remove = [k for k, (_, ts) in self.cache.items() if ts < cutoff]
+            for key in keys_to_remove:
+                del self.cache[key]
+
+
 class NetworkMonitor:
     def __init__(self, config: MonitorConfig):
         self.config = config
         self.rate_calculator = RateCalculator(config)
         self._lock = RLock()
-        self._ipv6_cache: Optional[Dict[str, List[str]]] = None
-        self._ipv6_cache_time: float = 0
-        self._mtu_cache: Dict[str, Optional[int]] = {}
-        self._state_cache: Dict[str, str] = {}
-        self._speed_cache: Dict[str, Optional[int]] = {}
-        self._duplex_cache: Dict[str, Optional[str]] = {}
+        self._ipv6_cache = LRUCache(max_size=MAX_CACHE_SIZE)
+        self._mtu_cache = LRUCache(max_size=MAX_CACHE_SIZE)
+        self._state_cache = LRUCache(max_size=MAX_CACHE_SIZE)
+        self._speed_cache = LRUCache(max_size=MAX_CACHE_SIZE)
+        self._duplex_cache = LRUCache(max_size=MAX_CACHE_SIZE)
         self._interface_cache: Optional[List[str]] = None
         self._interface_cache_time: float = 0
         self._prev_traffic: Dict[str, InterfaceTraffic] = {}
@@ -207,12 +244,11 @@ class NetworkMonitor:
         
     def cleanup(self):
         with self._lock:
-            if self._ipv6_cache is not None:
-                self._ipv6_cache.clear()
-            self._mtu_cache.clear()
-            self._state_cache.clear()
-            self._speed_cache.clear()
-            self._duplex_cache.clear()
+            self._ipv6_cache = LRUCache(max_size=MAX_CACHE_SIZE)
+            self._mtu_cache = LRUCache(max_size=MAX_CACHE_SIZE)
+            self._state_cache = LRUCache(max_size=MAX_CACHE_SIZE)
+            self._speed_cache = LRUCache(max_size=MAX_CACHE_SIZE)
+            self._duplex_cache = LRUCache(max_size=MAX_CACHE_SIZE)
             self._interface_cache = None
             self._prev_traffic.clear()
             self._rate_history.clear()
@@ -225,6 +261,9 @@ class NetworkMonitor:
         return DEFAULT_UNITS if self.config.units == "decimal" else BYTE_UNITS
 
     def format_bytes(self, size: int) -> str:
+        if size == 0:
+            return "0B"
+            
         divisor = self.get_divisor()
         units = self.get_units()
         unit_idx = 0
@@ -237,12 +276,12 @@ class NetworkMonitor:
         if unit_idx == 0:
             return f"{readable:.0f}{units[unit_idx]}"
         elif readable < 10:
-            return f"{readable:.2f}{units[unit_idx]}"
+            return f"{readable:.{self.config.precision}f}{units[unit_idx]}"
         else:
-            return f"{readable:.1f}{units[unit_idx]}"
+            return f"{readable:.{self.config.precision}f}{units[unit_idx]}"
 
     def format_rate_precise(self, bytes_per_sec: float) -> str:
-        if bytes_per_sec < 0:
+        if bytes_per_sec <= 0:
             return "0B/s"
         
         divisor = self.get_divisor()
@@ -257,9 +296,9 @@ class NetworkMonitor:
         if unit_idx == 0:
             return f"{readable:.0f}{units[unit_idx]}/s"
         elif readable < 10:
-            return f"{readable:.2f}{units[unit_idx]}/s"
+            return f"{readable:.{self.config.precision}f}{units[unit_idx]}/s"
         else:
-            return f"{readable:.1f}{units[unit_idx]}/s"
+            return f"{readable:.{self.config.precision}f}{units[unit_idx]}/s"
 
     def safe_interface_name(self, name: str) -> bool:
         if not name or not isinstance(name, str):
@@ -325,15 +364,13 @@ class NetworkMonitor:
         return state.lower() if state else "unknown"
 
     def get_interface_state(self, interface: str) -> str:
-        with self._lock:
-            if interface in self._state_cache:
-                return self._state_cache[interface]
+        cached = self._state_cache.get(interface)
+        if cached is not None:
+            return cached
         
         state = self._read_interface_state(interface)
-        
-        with self._lock:
-            self._state_cache[interface] = state
-            return state
+        self._state_cache.set(interface, state)
+        return state
 
     def _read_interface_speed(self, interface: str) -> Optional[int]:
         speed_str = self._read_sysfs_file(interface, "speed")
@@ -345,37 +382,33 @@ class NetworkMonitor:
         return None
 
     def get_interface_speed(self, interface: str) -> Optional[int]:
-        with self._lock:
-            if interface in self._speed_cache:
-                return self._speed_cache[interface]
+        cached = self._speed_cache.get(interface)
+        if cached is not None:
+            return cached
         
         speed = self._read_interface_speed(interface)
-        
-        with self._lock:
-            self._speed_cache[interface] = speed
-            return speed
+        self._speed_cache.set(interface, speed)
+        return speed
 
     def _read_interface_duplex(self, interface: str) -> Optional[str]:
         duplex = self._read_sysfs_file(interface, "duplex")
         return duplex.lower() if duplex else None
 
     def get_interface_duplex(self, interface: str) -> Optional[str]:
-        with self._lock:
-            if interface in self._duplex_cache:
-                return self._duplex_cache[interface]
+        cached = self._duplex_cache.get(interface)
+        if cached is not None:
+            return cached
         
         duplex = self._read_interface_duplex(interface)
-        
-        with self._lock:
-            self._duplex_cache[interface] = duplex
-            return duplex
+        self._duplex_cache.set(interface, duplex)
+        return duplex
 
     def get_available_interfaces(self) -> List[str]:
         now = time.time()
         with self._lock:
             if (self._interface_cache is not None and 
                 (now - self._interface_cache_time) < self.config.cache_ttl):
-                return self._interface_cache
+                return self._interface_cache[:]  # Return a copy
         
         try:
             interfaces = []
@@ -396,9 +429,9 @@ class NetworkMonitor:
             with self._lock:
                 self._interface_cache = sorted(interfaces)
                 self._interface_cache_time = now
-                return self._interface_cache
+                return self._interface_cache[:]  # Return a copy
         except (OSError, FileNotFoundError):
-            return self._interface_cache or []
+            return self._interface_cache[:] if self._interface_cache else []
 
     def validate_interfaces(self, requested_ifaces: Optional[List[str]]) -> List[str]:
         available = self.get_available_interfaces()
@@ -434,15 +467,13 @@ class NetworkMonitor:
             return None
 
     def get_mtu_cached(self, interface: str) -> Optional[int]:
-        with self._lock:
-            if interface in self._mtu_cache:
-                return self._mtu_cache[interface]
+        cached = self._mtu_cache.get(interface)
+        if cached is not None:
+            return cached
         
         mtu = self._get_mtu_uncached(interface)
-        
-        with self._lock:
-            self._mtu_cache[interface] = mtu
-            return mtu
+        self._mtu_cache.set(interface, mtu)
+        return mtu
 
     def get_ipv4_info(self, interface: str) -> Optional[str]:
         if not self.safe_interface_name(interface):
@@ -450,12 +481,12 @@ class NetworkMonitor:
             
         try:
             with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
-                ifr = struct.pack('16sH14s', interface.encode('utf-8')[:15], socket.AF_INET, b'\x00'*14)
+                ifr = struct.pack('256s', interface.encode('utf-8')[:15])
                 try:
-                    result = fcntl.ioctl(s.fileno(), 0x8915, ifr)
+                    result = fcntl.ioctl(s.fileno(), 0x8915, ifr)  # SIOCGIFADDR
                     ip_addr = socket.inet_ntoa(result[20:24])
                     
-                    result = fcntl.ioctl(s.fileno(), 0x891b, ifr)
+                    result = fcntl.ioctl(s.fileno(), 0x891b, ifr)  # SIOCGIFNETMASK
                     netmask = socket.inet_ntoa(result[20:24])
                     prefix = sum(bin(int(x)).count('1') for x in netmask.split('.'))
                     
@@ -471,10 +502,11 @@ class NetworkMonitor:
         try:
             with subprocess.Popen(["ip", "-6", "addr", "show"],
                                 stdout=subprocess.PIPE, 
-                                stderr=subprocess.PIPE,
-                                text=True) as proc:
+                                stderr=subprocess.DEVNULL,  # Suppress stderr
+                                text=True,
+                                shell=False) as proc:
                 try:
-                    stdout, stderr = proc.communicate(timeout=5)
+                    stdout, _ = proc.communicate(timeout=5)
                     if proc.returncode == 0 and stdout:
                         iface = None
                         for line in stdout.splitlines():
@@ -488,29 +520,28 @@ class NetworkMonitor:
                                 continue
                             if iface and "inet6" in line:
                                 parts = line.split()
-                                addr, prefix = parts[1].split("/")
-                                scope = "global" if "scope global" in line else "link"
-                                ipv6_map.setdefault(iface, []).append(f"{addr}/{prefix} ({scope})")
+                                if len(parts) >= 2:
+                                    addr_parts = parts[1].split("/")
+                                    if len(addr_parts) == 2:
+                                        addr, prefix = addr_parts
+                                        scope = "global" if "scope global" in line else "link"
+                                        ipv6_map.setdefault(iface, []).append(f"{addr}/{prefix} ({scope})")
                 except subprocess.TimeoutExpired:
                     proc.kill()
-                    stdout, stderr = proc.communicate()
-        except FileNotFoundError:
+                    proc.communicate()
+        except (FileNotFoundError, subprocess.SubprocessError):
             pass
         return ipv6_map
 
     def get_all_ipv6_info_cached(self) -> Dict[str, List[str]]:
         now = time.time()
-        with self._lock:
-            if (self._ipv6_cache is not None and 
-                (now - self._ipv6_cache_time) < self.config.cache_ttl):
-                return self._ipv6_cache
+        cached = self._ipv6_cache.get("all_ipv6_info")
+        if cached is not None:
+            return cached
         
         ipv6_map = self._get_all_ipv6_info_uncached()
-        
-        with self._lock:
-            self._ipv6_cache = ipv6_map
-            self._ipv6_cache_time = now
-            return self._ipv6_cache
+        self._ipv6_cache.set("all_ipv6_info", ipv6_map, timestamp=now)
+        return ipv6_map
 
     def _refresh_static_cache(self):
         static_info = {}
@@ -562,11 +593,10 @@ class NetworkMonitor:
             
             self._rate_history[interface].append((rx_rate, tx_rate, time.time()))
             
-            max_history = 60
-            if len(self._rate_history[interface]) > max_history:
-                self._rate_history[interface] = self._rate_history[interface][-max_history:]
+            if len(self._rate_history[interface]) > MAX_HISTORY_SIZE:
+                self._rate_history[interface] = self._rate_history[interface][-MAX_HISTORY_SIZE:]
             
-            if len(self._rate_history) > 100:
+            if len(self._rate_history) > MAX_CACHE_SIZE:
                 current_ifaces = set(self.get_available_interfaces())
                 stale_ifaces = set(self._rate_history.keys()) - current_ifaces
                 for stale in stale_ifaces:
@@ -590,7 +620,7 @@ class NetworkMonitor:
                 return 0.0, 0.0
             
             rx_rates = [rate[0] for rate in self._rate_history[interface]]
-            tx_rates = [rate[1] for rate in self._rate_history[interface]]
+            tx_rates = [rate[1] for rate in self._rate_history[iface]]
             
             return sum(rx_rates) / len(rx_rates), sum(tx_rates) / len(tx_rates)
 
@@ -763,7 +793,10 @@ def display_traffic_stats(monitor: NetworkMonitor, filter_ifaces: Optional[List[
 
 
 def clear_screen() -> None:
-    sys.stdout.write("\033[H\033[J")
+    if os.name == 'posix':
+        sys.stdout.write("\033[H\033[J")
+    else:
+        os.system('cls' if os.name == 'nt' else 'clear')
     sys.stdout.flush()
 
 
@@ -794,8 +827,13 @@ def watch_mode_improved(monitor: NetworkMonitor, filter_ifaces: Optional[List[st
                     rates = monitor.rate_calculator.calculate_all_rates(now, old, interval)
                     monitor.update_rate_history(iface, rates['rx_bytes_sec'], rates['tx_bytes_sec'])
             
+            # Sort by current RX rate if available, otherwise by interface name
             sorted_stats = sorted(curr_stats.items(), 
-                                key=lambda x: monitor.get_avg_rates(x[0])[0] if x[0] in prev_stats else 0, 
+                                key=lambda x: (monitor.rate_calculator.calculate_rate(
+                                    x[1].rx_bytes, 
+                                    prev_stats[x[0]].rx_bytes if x[0] in prev_stats else 0, 
+                                    interval
+                                ) if x[0] in prev_stats else 0, x[0]), 
                                 reverse=True)
             
             for iface, now in sorted_stats:
@@ -844,121 +882,55 @@ def watch_mode_improved(monitor: NetworkMonitor, filter_ifaces: Optional[List[st
             while sleep_remaining > 0 and not signal_handler.shutdown_requested:
                 time.sleep(min(0.1, sleep_remaining))
                 sleep_remaining -= 0.1
-            
     except KeyboardInterrupt:
-        pass
+        print(f"\n{Colors.GREY}Monitoring stopped.{Colors.RESET}")
     finally:
         signal_handler.restore_handlers()
-        print(f"\n{Colors.RED}Monitoring stopped after {update_count} updates.{Colors.RESET}")
 
 
-def output_json(monitor: NetworkMonitor, filter_ifaces: Optional[List[str]] = None) -> None:
-    try:
-        stats = parse_proc_net_dev(monitor, filter_ifaces)
-        payload = {}
-        for iface, traffic in stats.items():
-            payload[iface] = {
-                "rx_bytes": traffic.rx_bytes,
-                "tx_bytes": traffic.tx_bytes,
-                "rx_packets": traffic.rx_packets,
-                "tx_packets": traffic.tx_packets,
-                "rx_errs": traffic.rx_errs,
-                "tx_errs": traffic.tx_errs,
-                "rx_drop": traffic.rx_drop,
-                "tx_drop": traffic.tx_drop,
-                "mtu": traffic.mtu,
-                "state": traffic.state,
-                "ipv4_addr": traffic.ipv4_addr,
-                "ipv6_addrs": traffic.ipv6_addrs,
-                "speed": traffic.speed,
-                "duplex": traffic.duplex,
-                "is_active": traffic.is_active,
-                "is_up": traffic.is_up,
-                "total_bytes": traffic.total_bytes,
-                "total_packets": traffic.total_packets,
-            }
-        
-        json_str = json.dumps(payload, indent=2)
-        print(json_str)
-        
-    except (TypeError, ValueError, OverflowError) as e:
-        print(f'{{"error": "Failed to generate JSON: {str(e)}"}}', file=sys.stderr)
-        sys.exit(1)
-
-
-@contextlib.contextmanager
-def resource_cleanup():
-    try:
-        yield
-    finally:
-        pass
-
-
-def main() -> None:
-    config = MonitorConfig()
-    
-    parser = argparse.ArgumentParser(
-        description="Enhanced Network Monitor",
-        epilog="""Examples:
-  %(prog)s --watch
-  %(prog)s --json > out.json
-  %(prog)s -i eth0 wlan0 --watch
-  %(prog)s --units decimal --show-inactive
-  %(prog)s --hide-loopback --interval 2""",
-        formatter_class=argparse.RawTextHelpFormatter,
-    )
-    parser.add_argument("-i", "--interfaces", nargs="*", help="Limit output to given interfaces")
-    parser.add_argument("-w", "--watch", nargs="?", const=1.0, type=float,
-                       help="Watch mode with optional refresh interval (default 1s)")
-    parser.add_argument("--json", action="store_true", help="Produce JSON output")
-    parser.add_argument("--no-color", action="store_true", help="Disable ANSI colors")
+def main():
+    parser = argparse.ArgumentParser(description="Network interface monitor")
+    parser.add_argument("interfaces", nargs="*", help="Specific interfaces to monitor")
+    parser.add_argument("-i", "--interval", type=float, default=1.0, help="Update interval in seconds")
+    parser.add_argument("-w", "--watch", action="store_true", help="Watch mode")
+    parser.add_argument("--info", action="store_true", help="Show interface information")
+    parser.add_argument("--stats", action="store_true", help="Show traffic statistics")
+    parser.add_argument("--no-loopback", action="store_true", help="Hide loopback interfaces")
     parser.add_argument("--show-inactive", action="store_true", help="Show inactive interfaces")
-    parser.add_argument("--hide-loopback", action="store_true", help="Hide loopback interface")
-    parser.add_argument("--interval", type=float, default=1.0, help="Polling interval in seconds")
-    parser.add_argument("--cache-ttl", type=float, default=5.0, help="Cache TTL in seconds")
-    parser.add_argument("--max-interfaces", type=int, default=100, help="Maximum interfaces to display")
-    parser.add_argument("--units", choices=["binary", "decimal"], default="binary", 
-                       help="Display units (binary: KiB/MiB, decimal: KB/MB)")
-    parser.add_argument("--sort-by", choices=["name", "rx", "tx", "total"], default="name",
-                       help="Sort order for interfaces")
+    parser.add_argument("--units", choices=["binary", "decimal"], default="binary", help="Units for display")
+    parser.add_argument("--precision", type=int, default=1, help="Decimal precision")
+    parser.add_argument("--no-color", action="store_true", help="Disable colored output")
     
     args = parser.parse_args()
-
-    if not sys.platform.startswith("linux"):
-        print(f"{Colors.RED}Error: This tool only works on Linux systems.{Colors.RESET}", file=sys.stderr)
-        sys.exit(1)
-        
+    
     if args.no_color:
         Colors.disable()
-
-    config.interval = args.interval
-    config.cache_ttl = args.cache_ttl
-    config.max_interfaces = args.max_interfaces
-    config.show_loopback = not args.hide_loopback
-    config.show_inactive = args.show_inactive
-    config.units = args.units
-
-    config_errors = validate_config(config)
-    if config_errors:
-        for error in config_errors:
-            print(f"{Colors.RED}Configuration error: {error}{Colors.RESET}", file=sys.stderr)
+    
+    config = MonitorConfig(
+        interval=args.interval,
+        show_loopback=not args.no_loopback,
+        show_inactive=args.show_inactive,
+        units=args.units,
+        precision=args.precision
+    )
+    
+    errors = validate_config(config)
+    if errors:
+        for error in errors:
+            print(f"{Colors.RED}Error: {error}{Colors.RESET}", file=sys.stderr)
         sys.exit(1)
-
+    
     with NetworkMonitor(config) as monitor:
-        try:
-            if args.json:
-                output_json(monitor, args.interfaces)
-            elif args.watch is not None:
-                watch_mode_improved(monitor, args.interfaces, args.watch)
-            else:
-                display_network_info(monitor, args.interfaces)
-                display_traffic_stats(monitor, args.interfaces)
-        except KeyboardInterrupt:
-            print(f"\n{Colors.RED}Interrupted.{Colors.RESET}")
-            sys.exit(130)
-        except Exception as e:
-            print(f"{Colors.RED}Critical error: {e}{Colors.RESET}", file=sys.stderr)
-            sys.exit(1)
+        if args.info:
+            display_network_info(monitor, args.interfaces)
+        elif args.stats:
+            display_traffic_stats(monitor, args.interfaces)
+        elif args.watch:
+            watch_mode_improved(monitor, args.interfaces, args.interval)
+        else:
+            # Default: show both info and stats
+            display_network_info(monitor, args.interfaces)
+            display_traffic_stats(monitor, args.interfaces)
 
 
 if __name__ == "__main__":
