@@ -13,9 +13,10 @@ import sys
 import time
 import threading
 from dataclasses import dataclass, field
+from enum import Enum
 from pathlib import Path
 from threading import RLock
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Union, Callable, Any
 
 try:
     import psutil
@@ -31,6 +32,17 @@ MAX_CACHE_SIZE = 1000
 MAX_HISTORY_SIZE = 1000
 
 
+class InterfaceState(Enum):
+    UP = "up"
+    DOWN = "down"
+    UNKNOWN = "unknown"
+
+
+class DisplayUnits(Enum):
+    BINARY = "binary"
+    DECIMAL = "decimal"
+
+
 @dataclass
 class MonitorConfig:
     interval: float = 1.0
@@ -40,7 +52,7 @@ class MonitorConfig:
     show_inactive: bool = False
     precision: int = 1
     counter_bits: int = 64
-    units: str = "binary"
+    units: DisplayUnits = DisplayUnits.BINARY
     show_processes: bool = False
 
 
@@ -174,7 +186,7 @@ def validate_config(config: MonitorConfig) -> List[str]:
         errors.append("Max interfaces must be between 1 and 1000")
     if config.cache_ttl < 0:
         errors.append("Cache TTL must be positive")
-    if config.units not in ["binary", "decimal"]:
+    if config.units not in [DisplayUnits.BINARY, DisplayUnits.DECIMAL]:
         errors.append("Units must be 'binary' or 'decimal'")
     if config.counter_bits not in [32, 64]:
         errors.append("Counter bits must be 32 or 64")
@@ -193,7 +205,6 @@ class LRUCache:
         with self._lock:
             if key in self.cache:
                 value, timestamp = self.cache[key]
-                # Move to end (most recently used)
                 del self.cache[key]
                 self.cache[key] = (value, timestamp)
                 return value
@@ -206,7 +217,6 @@ class LRUCache:
             if key in self.cache:
                 del self.cache[key]
             elif len(self.cache) >= self.max_size:
-                # Remove least recently used
                 oldest_key = next(iter(self.cache))
                 del self.cache[oldest_key]
             self.cache[key] = (value, timestamp)
@@ -255,50 +265,38 @@ class NetworkMonitor:
             self._static_info_cache.clear()
 
     def get_divisor(self) -> int:
-        return 1000 if self.config.units == "decimal" else 1024
+        return 1000 if self.config.units == DisplayUnits.DECIMAL else 1024
 
     def get_units(self) -> List[str]:
-        return DEFAULT_UNITS if self.config.units == "decimal" else BYTE_UNITS
+        return DEFAULT_UNITS if self.config.units == DisplayUnits.DECIMAL else BYTE_UNITS
 
-    def format_bytes(self, size: int) -> str:
-        if size == 0:
-            return "0B"
+    def _format_quantity(self, value: float, per_second: bool = False) -> str:
+        if value <= 0:
+            return "0B" + ("/s" if per_second else "")
             
         divisor = self.get_divisor()
         units = self.get_units()
         unit_idx = 0
-        readable = float(size)
+        readable = float(value)
         
         while readable >= divisor and unit_idx < len(units) - 1:
             readable /= divisor
             unit_idx += 1
         
+        suffix = "/s" if per_second else ""
+        
         if unit_idx == 0:
-            return f"{readable:.0f}{units[unit_idx]}"
+            return f"{readable:.0f}{units[unit_idx]}{suffix}"
         elif readable < 10:
-            return f"{readable:.{self.config.precision}f}{units[unit_idx]}"
+            return f"{readable:.{self.config.precision}f}{units[unit_idx]}{suffix}"
         else:
-            return f"{readable:.{self.config.precision}f}{units[unit_idx]}"
+            return f"{readable:.{self.config.precision}f}{units[unit_idx]}{suffix}"
 
-    def format_rate_precise(self, bytes_per_sec: float) -> str:
-        if bytes_per_sec <= 0:
-            return "0B/s"
-        
-        divisor = self.get_divisor()
-        units = self.get_units()
-        unit_idx = 0
-        readable = float(bytes_per_sec)
-        
-        while readable >= divisor and unit_idx < len(units) - 1:
-            readable /= divisor
-            unit_idx += 1
-        
-        if unit_idx == 0:
-            return f"{readable:.0f}{units[unit_idx]}/s"
-        elif readable < 10:
-            return f"{readable:.{self.config.precision}f}{units[unit_idx]}/s"
-        else:
-            return f"{readable:.{self.config.precision}f}{units[unit_idx]}/s"
+    def format_bytes(self, size: int) -> str:
+        return self._format_quantity(size, per_second=False)
+
+    def format_rate(self, bytes_per_sec: float) -> str:
+        return self._format_quantity(bytes_per_sec, per_second=True)
 
     def safe_interface_name(self, name: str) -> bool:
         if not name or not isinstance(name, str):
@@ -356,7 +354,9 @@ class NetworkMonitor:
                 
             with open(file_path, 'r') as f:
                 return f.read().strip()
-        except (OSError, IOError, PermissionError, FileNotFoundError):
+        except (OSError, IOError, PermissionError, FileNotFoundError) as e:
+            if isinstance(e, (PermissionError, OSError)) and e.errno == 13:
+                sys.stderr.write(f"Permission denied accessing {file_path}\n")
             return None
 
     def _read_interface_state(self, interface: str) -> str:
@@ -408,7 +408,7 @@ class NetworkMonitor:
         with self._lock:
             if (self._interface_cache is not None and 
                 (now - self._interface_cache_time) < self.config.cache_ttl):
-                return self._interface_cache[:]  # Return a copy
+                return self._interface_cache[:]
         
         try:
             interfaces = []
@@ -429,7 +429,7 @@ class NetworkMonitor:
             with self._lock:
                 self._interface_cache = sorted(interfaces)
                 self._interface_cache_time = now
-                return self._interface_cache[:]  # Return a copy
+                return self._interface_cache[:]
         except (OSError, FileNotFoundError):
             return self._interface_cache[:] if self._interface_cache else []
 
@@ -483,10 +483,10 @@ class NetworkMonitor:
             with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
                 ifr = struct.pack('256s', interface.encode('utf-8')[:15])
                 try:
-                    result = fcntl.ioctl(s.fileno(), 0x8915, ifr)  # SIOCGIFADDR
+                    result = fcntl.ioctl(s.fileno(), 0x8915, ifr)
                     ip_addr = socket.inet_ntoa(result[20:24])
                     
-                    result = fcntl.ioctl(s.fileno(), 0x891b, ifr)  # SIOCGIFNETMASK
+                    result = fcntl.ioctl(s.fileno(), 0x891b, ifr)
                     netmask = socket.inet_ntoa(result[20:24])
                     prefix = sum(bin(int(x)).count('1') for x in netmask.split('.'))
                     
@@ -502,7 +502,7 @@ class NetworkMonitor:
         try:
             with subprocess.Popen(["ip", "-6", "addr", "show"],
                                 stdout=subprocess.PIPE, 
-                                stderr=subprocess.DEVNULL,  # Suppress stderr
+                                stderr=subprocess.DEVNULL,
                                 text=True,
                                 shell=False) as proc:
                 try:
@@ -620,9 +620,19 @@ class NetworkMonitor:
                 return 0.0, 0.0
             
             rx_rates = [rate[0] for rate in self._rate_history[interface]]
-            tx_rates = [rate[1] for rate in self._rate_history[iface]]
+            tx_rates = [rate[1] for rate in self._rate_history[interface]]
             
             return sum(rx_rates) / len(rx_rates), sum(tx_rates) / len(tx_rates)
+
+    def calculate_utilization_percentage(self, interface: str, rx_rate: float, tx_rate: float) -> Tuple[float, float]:
+        speed = self.get_interface_speed(interface)
+        if not speed:
+            return 0.0, 0.0
+        
+        max_bps = speed * 1_000_000
+        rx_percent = (rx_rate * 8 / max_bps) * 100 if max_bps > 0 else 0.0
+        tx_percent = (tx_rate * 8 / max_bps) * 100 if max_bps > 0 else 0.0
+        return min(rx_percent, 100.0), min(tx_percent, 100.0)
 
     def get_network_processes(self) -> List[Dict]:
         if not psutil:
@@ -806,14 +816,17 @@ def watch_mode_improved(monitor: NetworkMonitor, filter_ifaces: Optional[List[st
         return
         
     prev_stats: Dict[str, InterfaceTraffic] = {}
-    start_time = time.time()
+    start_time = time.monotonic()
     update_count = 0
     signal_handler = SignalHandler()
+    
+    _sorted_stats_cache: Dict[str, List[Tuple[str, InterfaceTraffic]]] = {}
+    _cache_time = 0.0
     
     try:
         while not signal_handler.shutdown_requested:
             clear_screen()
-            current_time = time.time()
+            current_time = time.monotonic()
             elapsed_total = current_time - start_time
             
             print(f"{Colors.BLUE}Live Network Traffic Monitor{Colors.RESET}")
@@ -827,14 +840,18 @@ def watch_mode_improved(monitor: NetworkMonitor, filter_ifaces: Optional[List[st
                     rates = monitor.rate_calculator.calculate_all_rates(now, old, interval)
                     monitor.update_rate_history(iface, rates['rx_bytes_sec'], rates['tx_bytes_sec'])
             
-            # Sort by current RX rate if available, otherwise by interface name
-            sorted_stats = sorted(curr_stats.items(), 
-                                key=lambda x: (monitor.rate_calculator.calculate_rate(
-                                    x[1].rx_bytes, 
-                                    prev_stats[x[0]].rx_bytes if x[0] in prev_stats else 0, 
-                                    interval
-                                ) if x[0] in prev_stats else 0, x[0]), 
-                                reverse=True)
+            cache_key = f"{interval}_{len(curr_stats)}"
+            if current_time - _cache_time > 1.0 or cache_key not in _sorted_stats_cache:
+                _sorted_stats_cache[cache_key] = sorted(curr_stats.items(), 
+                    key=lambda x: (monitor.rate_calculator.calculate_rate(
+                        x[1].rx_bytes, 
+                        prev_stats[x[0]].rx_bytes if x[0] in prev_stats else 0, 
+                        interval
+                    ) if x[0] in prev_stats else 0, x[0]), 
+                    reverse=True)
+                _cache_time = current_time
+            
+            sorted_stats = _sorted_stats_cache[cache_key]
             
             for iface, now in sorted_stats:
                 state_color = Colors.GREEN if now.is_up else Colors.RED
@@ -846,11 +863,17 @@ def watch_mode_improved(monitor: NetworkMonitor, filter_ifaces: Optional[List[st
                     tx_rate = monitor.rate_calculator.calculate_rate(now.tx_bytes, prev_stats[iface].tx_bytes, interval)
                     avg_rx, avg_tx = monitor.get_avg_rates(iface)
                     
+                    rx_util, tx_util = monitor.calculate_utilization_percentage(iface, rx_rate, tx_rate)
+                    
                     line_parts.extend([
-                        f"RX: {Colors.GREEN}{monitor.format_rate_precise(rx_rate):<12}{Colors.RESET}",
-                        f"TX: {Colors.YELLOW}{monitor.format_rate_precise(tx_rate):<12}{Colors.RESET}",
-                        f"Avg: {Colors.CYAN}{monitor.format_rate_precise(avg_rx)}/{monitor.format_rate_precise(avg_tx)}{Colors.RESET}"
+                        f"RX: {Colors.GREEN}{monitor.format_rate(rx_rate):<12}{Colors.RESET}",
+                        f"TX: {Colors.YELLOW}{monitor.format_rate(tx_rate):<12}{Colors.RESET}",
+                        f"Avg: {Colors.CYAN}{monitor.format_rate(avg_rx)}/{monitor.format_rate(avg_tx)}{Colors.RESET}"
                     ])
+                    
+                    if rx_util > 0 or tx_util > 0:
+                        util_color = Colors.RED if rx_util > 80 or tx_util > 80 else Colors.YELLOW
+                        line_parts.append(f"{util_color}Util: {rx_util:.1f}%/{tx_util:.1f}%{Colors.RESET}")
                 else:
                     line_parts.extend([
                         f"RX: {Colors.GREEN}{monitor.format_bytes(now.rx_bytes):<12}{Colors.RESET}",
@@ -906,11 +929,17 @@ def main():
     if args.no_color:
         Colors.disable()
     
+    try:
+        units_enum = DisplayUnits(args.units)
+    except ValueError:
+        print(f"{Colors.RED}Error: Invalid units value '{args.units}'{Colors.RESET}", file=sys.stderr)
+        sys.exit(1)
+    
     config = MonitorConfig(
         interval=args.interval,
         show_loopback=not args.no_loopback,
         show_inactive=args.show_inactive,
-        units=args.units,
+        units=units_enum,
         precision=args.precision
     )
     
@@ -928,7 +957,6 @@ def main():
         elif args.watch:
             watch_mode_improved(monitor, args.interfaces, args.interval)
         else:
-            # Default: show both info and stats
             display_network_info(monitor, args.interfaces)
             display_traffic_stats(monitor, args.interfaces)
 
