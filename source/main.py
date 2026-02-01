@@ -76,9 +76,9 @@ class Colors:
 
 class SignalHandler:
     def __init__(self):
+        self._lock = threading.Lock()
         self.shutdown_requested = False
         self.original_handlers = {}
-        self._lock = threading.Lock()
         
         for sig in [signal.SIGINT, signal.SIGTERM]:
             try:
@@ -97,6 +97,10 @@ class SignalHandler:
                 signal.signal(signum, handler)
             except (ValueError, OSError):
                 pass
+    
+    def should_shutdown(self) -> bool:
+        with self._lock:
+            return self.shutdown_requested
 
 
 @dataclass
@@ -173,7 +177,9 @@ def with_retry(max_attempts: int = 3, delay: float = 0.1):
                     last_exception = e
                     if attempt < max_attempts - 1:
                         time.sleep(delay * (2 ** attempt))
-            raise last_exception
+            if last_exception:
+                raise last_exception
+            return None
         return wrapper
     return decorator
 
@@ -224,9 +230,13 @@ class LRUCache:
     def cleanup_old(self, max_age: float):
         cutoff = time.time() - max_age
         with self._lock:
-            keys_to_remove = [k for k, (_, ts) in self.cache.items() if ts < cutoff]
+            keys_to_remove = []
+            for k, (_, ts) in self.cache.items():
+                if ts < cutoff:
+                    keys_to_remove.append(k)
             for key in keys_to_remove:
-                del self.cache[key]
+                if key in self.cache:
+                    del self.cache[key]
 
 
 class NetworkMonitor:
@@ -245,6 +255,7 @@ class NetworkMonitor:
         self._rate_history: Dict[str, List[Tuple[float, float, float]]] = {}
         self._static_info_cache: Dict[str, Dict] = {}
         self._static_cache_time: float = 0
+        self._static_cache_lock = threading.Lock()
 
     def __enter__(self):
         return self
@@ -353,7 +364,8 @@ class NetworkMonitor:
                 return None
                 
             with open(file_path, 'r') as f:
-                return f.read().strip()
+                content = f.read(MAX_FILE_SIZE)
+                return content.strip()
         except (OSError, IOError, PermissionError, FileNotFoundError) as e:
             if isinstance(e, (PermissionError, OSError)) and e.errno == 13:
                 sys.stderr.write(f"Permission denied accessing {file_path}\n")
@@ -442,8 +454,8 @@ class NetworkMonitor:
         invalid_ifaces = set(requested_ifaces) - set(valid_ifaces)
         
         if invalid_ifaces:
-            print(f"{Colors.RED}Warning: Invalid interfaces: {sorted(invalid_ifaces)}{Colors.RESET}", 
-                  file=sys.stderr)
+            sys.stderr.write(f"{Colors.RED}Warning: Invalid interfaces: {sorted(invalid_ifaces)}{Colors.RESET}\n")
+            sys.stderr.flush()
         
         return valid_ifaces
 
@@ -527,9 +539,13 @@ class NetworkMonitor:
                                         scope = "global" if "scope global" in line else "link"
                                         ipv6_map.setdefault(iface, []).append(f"{addr}/{prefix} ({scope})")
                 except subprocess.TimeoutExpired:
-                    proc.kill()
-                    proc.communicate()
-        except (FileNotFoundError, subprocess.SubprocessError):
+                    if proc:
+                        proc.terminate()
+                        try:
+                            proc.wait(timeout=2)
+                        except subprocess.TimeoutExpired:
+                            proc.kill()
+        except (FileNotFoundError, subprocess.SubprocessError, OSError):
             pass
         return ipv6_map
 
@@ -553,14 +569,16 @@ class NetworkMonitor:
                 'duplex': self.get_interface_duplex(iface),
                 'addrs': self.get_interface_addrs(iface)
             }
-        self._static_info_cache = static_info
-        self._static_cache_time = time.time()
+        with self._static_cache_lock:
+            self._static_info_cache = static_info
+            self._static_cache_time = time.time()
 
     def get_static_interface_info(self, interface: str) -> Dict:
         now = time.time()
         if now - self._static_cache_time > 30:
             self._refresh_static_cache()
-        return self._static_info_cache.get(interface, {})
+        with self._static_cache_lock:
+            return self._static_info_cache.get(interface, {})
 
     def get_interface_addrs(self, interface: str) -> Dict[str, List[str]]:
         addrs = {"ipv4": [], "ipv6": []}
@@ -748,11 +766,12 @@ def parse_proc_net_dev(monitor: NetworkMonitor, filter_ifaces: Optional[List[str
 
 
 def display_network_info(monitor: NetworkMonitor, filter_ifaces: Optional[List[str]] = None) -> None:
-    print(f"{Colors.BLUE}Network Interface Information:{Colors.RESET}")
+    sys.stdout.write(f"{Colors.BLUE}Network Interface Information:{Colors.RESET}\n")
     valid_ifaces = monitor.validate_interfaces(filter_ifaces)
     
     if not valid_ifaces:
-        print(f"{Colors.GREY}No interfaces found.{Colors.RESET}")
+        sys.stdout.write(f"{Colors.GREY}No interfaces found.{Colors.RESET}\n")
+        sys.stdout.flush()
         return
     
     for iface in valid_ifaces:
@@ -764,25 +783,28 @@ def display_network_info(monitor: NetworkMonitor, filter_ifaces: Optional[List[s
         speed = static_info.get('speed')
         duplex = static_info.get('duplex')
         
-        print(f"\n{Colors.SEPIA}{iface}{Colors.RESET} [{state_color}{state}{Colors.RESET}]")
+        sys.stdout.write(f"\n{Colors.SEPIA}{iface}{Colors.RESET} [{state_color}{state}{Colors.RESET}]\n")
         
         if speed:
             duplex_str = f", {duplex}" if duplex else ""
-            print(f"  Speed: {speed} Mbps{duplex_str}")
+            sys.stdout.write(f"  Speed: {speed} Mbps{duplex_str}\n")
             
         if mtu:
-            print(f"  MTU: {mtu}")
+            sys.stdout.write(f"  MTU: {mtu}\n")
             
-        print(f"  Addresses: {monitor.format_addrs_string(addrs)}")
+        sys.stdout.write(f"  Addresses: {monitor.format_addrs_string(addrs)}\n")
+    
+    sys.stdout.flush()
 
 
 def display_traffic_stats(monitor: NetworkMonitor, filter_ifaces: Optional[List[str]] = None) -> None:
     stats = parse_proc_net_dev(monitor, filter_ifaces)
     if not stats:
-        print(f"{Colors.GREY}No traffic statistics available.{Colors.RESET}")
+        sys.stdout.write(f"{Colors.GREY}No traffic statistics available.{Colors.RESET}\n")
+        sys.stdout.flush()
         return
         
-    print(f"{Colors.BLUE}\nTraffic Statistics:{Colors.RESET}")
+    sys.stdout.write(f"{Colors.BLUE}\nTraffic Statistics:{Colors.RESET}\n")
     
     sorted_stats = sorted(stats.items(), key=lambda x: x[1].total_bytes, reverse=True)
     
@@ -790,16 +812,18 @@ def display_traffic_stats(monitor: NetworkMonitor, filter_ifaces: Optional[List[
         state_color = Colors.GREEN if traffic.is_up else Colors.RED
         speed_info = f" ({traffic.speed} Mbps)" if traffic.speed else ""
         
-        print(f"\n{Colors.SEPIA}{iface:<12}{Colors.RESET} [{state_color}{traffic.state}{Colors.RESET}]{speed_info}")
-        print(f"  RX: {Colors.GREEN}{monitor.format_bytes(traffic.rx_bytes):<12}{Colors.RESET} "
-              f"{Colors.GREY}({traffic.rx_packets} pkts, {traffic.rx_errs} errs, {traffic.rx_drop} drop){Colors.RESET}")
-        print(f"  TX: {Colors.YELLOW}{monitor.format_bytes(traffic.tx_bytes):<12}{Colors.RESET} "
-              f"{Colors.GREY}({traffic.tx_packets} pkts, {traffic.tx_errs} errs, {traffic.tx_drop} drop){Colors.RESET}")
+        sys.stdout.write(f"\n{Colors.SEPIA}{iface:<12}{Colors.RESET} [{state_color}{traffic.state}{Colors.RESET}]{speed_info}\n")
+        sys.stdout.write(f"  RX: {Colors.GREEN}{monitor.format_bytes(traffic.rx_bytes):<12}{Colors.RESET} "
+              f"{Colors.GREY}({traffic.rx_packets} pkts, {traffic.rx_errs} errs, {traffic.rx_drop} drop){Colors.RESET}\n")
+        sys.stdout.write(f"  TX: {Colors.YELLOW}{monitor.format_bytes(traffic.tx_bytes):<12}{Colors.RESET} "
+              f"{Colors.GREY}({traffic.tx_packets} pkts, {traffic.tx_errs} errs, {traffic.tx_drop} drop){Colors.RESET}\n")
         
         if traffic.is_active:
             total = monitor.format_bytes(traffic.total_bytes)
-            print(f"  Total: {Colors.CYAN}{total}{Colors.RESET} "
-                  f"({traffic.total_packets} total packets)")
+            sys.stdout.write(f"  Total: {Colors.CYAN}{total}{Colors.RESET} "
+                  f"({traffic.total_packets} total packets)\n")
+    
+    sys.stdout.flush()
 
 
 def clear_screen() -> None:
@@ -812,7 +836,8 @@ def clear_screen() -> None:
 
 def watch_mode_improved(monitor: NetworkMonitor, filter_ifaces: Optional[List[str]], interval: float) -> None:
     if interval < 0.01:
-        print(f"{Colors.RED}Interval too small: {interval}s{Colors.RESET}")
+        sys.stderr.write(f"{Colors.RED}Interval too small: {interval}s{Colors.RESET}\n")
+        sys.stderr.flush()
         return
         
     prev_stats: Dict[str, InterfaceTraffic] = {}
@@ -824,13 +849,13 @@ def watch_mode_improved(monitor: NetworkMonitor, filter_ifaces: Optional[List[st
     _cache_time = 0.0
     
     try:
-        while not signal_handler.shutdown_requested:
+        while not signal_handler.should_shutdown():
             clear_screen()
             current_time = time.monotonic()
             elapsed_total = current_time - start_time
             
-            print(f"{Colors.BLUE}Live Network Traffic Monitor{Colors.RESET}")
-            print(f"{Colors.GREY}Interval: {interval}s | Uptime: {elapsed_total:.0f}s | Updates: {update_count}{Colors.RESET}\n")
+            sys.stdout.write(f"{Colors.BLUE}Live Network Traffic Monitor{Colors.RESET}\n")
+            sys.stdout.write(f"{Colors.GREY}Interval: {interval}s | Uptime: {elapsed_total:.0f}s | Updates: {update_count}{Colors.RESET}\n\n")
             
             curr_stats = parse_proc_net_dev(monitor, filter_ifaces, include_static=False)
             
@@ -881,20 +906,21 @@ def watch_mode_improved(monitor: NetworkMonitor, filter_ifaces: Optional[List[st
                         f"{Colors.GREY}(initial){Colors.RESET}"
                     ])
                 
-                print(" ".join(line_parts))
+                sys.stdout.write(" ".join(line_parts) + "\n")
             
             if not curr_stats:
-                print(f"{Colors.GREY}No active interfaces to monitor.{Colors.RESET}")
+                sys.stdout.write(f"{Colors.GREY}No active interfaces to monitor.{Colors.RESET}\n")
             
             active_count = sum(1 for traffic in curr_stats.values() if traffic.is_active)
             total_rx = sum(t.rx_bytes for t in curr_stats.values())
             total_tx = sum(t.tx_bytes for t in curr_stats.values())
             
-            print(f"\n{Colors.GREY}[Ctrl+C to stop] | "
+            sys.stdout.write(f"\n{Colors.GREY}[Ctrl+C to stop] | "
                   f"Interfaces: {len(curr_stats)} (active: {active_count}) | "
                   f"Total: RX{monitor.format_bytes(total_rx)} TX{monitor.format_bytes(total_tx)} | "
-                  f"{time.strftime('%H:%M:%S')}{Colors.RESET}")
+                  f"{time.strftime('%H:%M:%S')}{Colors.RESET}\n")
             
+            sys.stdout.flush()
             prev_stats = curr_stats
             update_count += 1
             
@@ -902,11 +928,12 @@ def watch_mode_improved(monitor: NetworkMonitor, filter_ifaces: Optional[List[st
                 monitor.cleanup_old_history()
             
             sleep_remaining = interval
-            while sleep_remaining > 0 and not signal_handler.shutdown_requested:
+            while sleep_remaining > 0 and not signal_handler.should_shutdown():
                 time.sleep(min(0.1, sleep_remaining))
                 sleep_remaining -= 0.1
     except KeyboardInterrupt:
-        print(f"\n{Colors.GREY}Monitoring stopped.{Colors.RESET}")
+        sys.stdout.write(f"\n{Colors.GREY}Monitoring stopped.{Colors.RESET}\n")
+        sys.stdout.flush()
     finally:
         signal_handler.restore_handlers()
 
@@ -932,7 +959,7 @@ def main():
     try:
         units_enum = DisplayUnits(args.units)
     except ValueError:
-        print(f"{Colors.RED}Error: Invalid units value '{args.units}'{Colors.RESET}", file=sys.stderr)
+        sys.stderr.write(f"{Colors.RED}Error: Invalid units value '{args.units}'{Colors.RESET}\n")
         sys.exit(1)
     
     config = MonitorConfig(
@@ -946,7 +973,7 @@ def main():
     errors = validate_config(config)
     if errors:
         for error in errors:
-            print(f"{Colors.RED}Error: {error}{Colors.RESET}", file=sys.stderr)
+            sys.stderr.write(f"{Colors.RED}Error: {error}{Colors.RESET}\n")
         sys.exit(1)
     
     with NetworkMonitor(config) as monitor:
