@@ -12,6 +12,7 @@ import subprocess
 import sys
 import time
 import threading
+import types
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
@@ -82,7 +83,7 @@ class SignalHandler:
             except (ValueError, OSError):
                 pass
     
-    def _signal_handler(self, signum: int, frame) -> None:
+    def _signal_handler(self, signum: int, frame: Optional[types.FrameType]) -> None:
         with self._lock:
             self.shutdown_requested = True
         
@@ -139,14 +140,19 @@ class RateCalculator:
         if interval <= 0:
             return 0.0
             
+        if interval < 0.001:
+            interval = 0.001
+            
         try:
             if current >= previous:
-                return (current - previous) / interval
+                diff = current - previous
             else:
                 max_count = 2**self.config.counter_bits - 1
-                if max_count <= 0:
-                    max_count = 2**64 - 1
-                return ((max_count - previous) + current + 1) / interval
+                diff = (max_count - previous) + current + 1
+            
+            max_reasonable_rate = 100 * 1e9
+            rate = diff / interval
+            return min(rate, max_reasonable_rate)
         except (ZeroDivisionError, OverflowError):
             return 0.0
     
@@ -222,13 +228,7 @@ class LRUCache:
     def cleanup_old(self, max_age: float):
         cutoff = time.time() - max_age
         with self._lock:
-            keys_to_remove = []
-            for k, (_, ts) in self.cache.items():
-                if ts < cutoff:
-                    keys_to_remove.append(k)
-            for key in keys_to_remove:
-                if key in self.cache:
-                    del self.cache[key]
+            self.cache = {k: v for k, v in self.cache.items() if v[1] >= cutoff}
 
 class NetworkMonitor:
     def __init__(self, config: MonitorConfig):
@@ -312,19 +312,21 @@ class NetworkMonitor:
             return False
         if any(c in name for c in ['/', '\\', '..', '\0']):
             return False
-        return all(c.isalnum() or c in ("-", "_", ".", ":") for c in name) and len(name) <= 64
+        if len(name) > 15:
+            return False
+        return all(c.isalnum() or c in ("-", "_", ".", ":") for c in name)
 
     def validate_sysfs_path(self, file_path: str) -> bool:
         try:
-            normalized_path = os.path.normpath(file_path)
-            if not normalized_path.startswith(SYSFS_NET_PATH + os.sep):
+            resolved_path = os.path.realpath(file_path)
+            if not resolved_path.startswith(SYSFS_NET_PATH):
                 return False
             
-            relative_path = os.path.relpath(normalized_path, SYSFS_NET_PATH)
-            if relative_path.startswith('..') or os.path.isabs(relative_path):
+            remaining = os.path.relpath(resolved_path, SYSFS_NET_PATH)
+            if remaining.startswith('..') or os.path.isabs(remaining):
                 return False
             
-            path_parts = relative_path.split(os.sep)
+            path_parts = remaining.split(os.sep)
             if len(path_parts) < 1:
                 return False
             
@@ -517,48 +519,50 @@ class NetworkMonitor:
 
     def _get_all_ipv6_info_uncached(self) -> Dict[str, List[str]]:
         ipv6_map: Dict[str, List[str]] = {}
+        proc = None
         
         if not self._ip_binary_path:
             return ipv6_map
             
         try:
-            with subprocess.Popen([self._ip_binary_path, "-6", "addr", "show"],
-                                stdout=subprocess.PIPE, 
-                                stderr=subprocess.DEVNULL,
-                                text=True,
-                                shell=False) as proc:
-                try:
-                    stdout, _ = proc.communicate(timeout=5)
-                    if proc.returncode == 0 and stdout:
-                        iface = None
-                        for line in stdout.splitlines():
-                            line = line.strip()
-                            if not line:
-                                continue
-                            if line and line[0].isdigit() and ":" in line:
-                                parts = line.split(":", 2)
-                                if len(parts) >= 2:
-                                    iface = parts[1].strip().split("@")[0]
-                                    if iface and not self.safe_interface_name(iface):
-                                        iface = None
-                                continue
-                            if iface and "inet6" in line:
-                                parts = line.split()
-                                if len(parts) >= 2:
-                                    addr_parts = parts[1].split("/")
-                                    if len(addr_parts) == 2:
-                                        addr, prefix = addr_parts
-                                        scope = "global" if "scope global" in line else "link"
-                                        ipv6_map.setdefault(iface, []).append(f"{addr}/{prefix} ({scope})")
-                except subprocess.TimeoutExpired:
-                    if proc:
-                        proc.terminate()
-                        try:
-                            proc.wait(timeout=2)
-                        except subprocess.TimeoutExpired:
-                            proc.kill()
+            proc = subprocess.Popen([self._ip_binary_path, "-6", "addr", "show"],
+                                   stdout=subprocess.PIPE, 
+                                   stderr=subprocess.DEVNULL,
+                                   text=True,
+                                   shell=False)
+            try:
+                stdout, _ = proc.communicate(timeout=5)
+                if proc.returncode == 0 and stdout:
+                    iface = None
+                    for line in stdout.splitlines():
+                        line = line.strip()
+                        if not line:
+                            continue
+                        if line and line[0].isdigit() and ":" in line:
+                            parts = line.split(":", 2)
+                            if len(parts) >= 2:
+                                iface = parts[1].strip().split("@")[0]
+                                if iface and not self.safe_interface_name(iface):
+                                    iface = None
+                            continue
+                        if iface and "inet6" in line:
+                            parts = line.split()
+                            if len(parts) >= 2:
+                                addr_parts = parts[1].split("/")
+                                if len(addr_parts) == 2:
+                                    addr, prefix = addr_parts
+                                    scope = "global" if "scope global" in line else "link"
+                                    ipv6_map.setdefault(iface, []).append(f"{addr}/{prefix} ({scope})")
+            except subprocess.TimeoutExpired:
+                if proc:
+                    proc.kill()
+                    stdout, _ = proc.communicate()
         except (FileNotFoundError, subprocess.SubprocessError, OSError):
             pass
+        finally:
+            if proc and proc.poll() is None:
+                proc.kill()
+                proc.wait()
         return ipv6_map
 
     def get_all_ipv6_info_cached(self) -> Dict[str, List[str]]:
@@ -794,11 +798,12 @@ def parse_proc_net_dev(monitor: NetworkMonitor, filter_ifaces: Optional[List[str
     return stats
 
 def display_network_info(monitor: NetworkMonitor, filter_ifaces: Optional[List[str]] = None) -> None:
-    sys.stdout.write(f"{Colors.BLUE}Network Interface Information:{Colors.RESET}\n")
+    output_lines = [f"{Colors.BLUE}Network Interface Information:{Colors.RESET}"]
     valid_ifaces = monitor.validate_interfaces(filter_ifaces)
     
     if not valid_ifaces:
-        sys.stdout.write(f"{Colors.GREY}No interfaces found.{Colors.RESET}\n")
+        output_lines.append(f"{Colors.GREY}No interfaces found.{Colors.RESET}")
+        sys.stdout.write("\n".join(output_lines) + "\n")
         sys.stdout.flush()
         return
     
@@ -811,27 +816,31 @@ def display_network_info(monitor: NetworkMonitor, filter_ifaces: Optional[List[s
         speed = static_info.get('speed')
         duplex = static_info.get('duplex')
         
-        sys.stdout.write(f"\n{Colors.SEPIA}{iface}{Colors.RESET} [{state_color}{state}{Colors.RESET}]\n")
+        output_lines.append(f"\n{Colors.SEPIA}{iface}{Colors.RESET} [{state_color}{state}{Colors.RESET}]")
         
         if speed:
             duplex_str = f", {duplex}" if duplex else ""
-            sys.stdout.write(f"  Speed: {speed} Mbps{duplex_str}\n")
+            output_lines.append(f"  Speed: {speed} Mbps{duplex_str}")
             
         if mtu:
-            sys.stdout.write(f"  MTU: {mtu}\n")
+            output_lines.append(f"  MTU: {mtu}")
             
-        sys.stdout.write(f"  Addresses: {monitor.format_addrs_string(addrs)}\n")
+        output_lines.append(f"  Addresses: {monitor.format_addrs_string(addrs)}")
     
+    sys.stdout.write("\n".join(output_lines) + "\n")
     sys.stdout.flush()
 
 def display_traffic_stats(monitor: NetworkMonitor, filter_ifaces: Optional[List[str]] = None) -> None:
     stats = parse_proc_net_dev(monitor, filter_ifaces)
+    output_lines = []
+    
     if not stats:
-        sys.stdout.write(f"{Colors.GREY}No traffic statistics available.{Colors.RESET}\n")
+        output_lines.append(f"{Colors.GREY}No traffic statistics available.{Colors.RESET}")
+        sys.stdout.write("\n".join(output_lines) + "\n")
         sys.stdout.flush()
         return
         
-    sys.stdout.write(f"{Colors.BLUE}\nTraffic Statistics:{Colors.RESET}\n")
+    output_lines.append(f"{Colors.BLUE}\nTraffic Statistics:{Colors.RESET}")
     
     sorted_stats = sorted(stats.items(), key=lambda x: x[1].total_bytes, reverse=True)
     
@@ -839,17 +848,18 @@ def display_traffic_stats(monitor: NetworkMonitor, filter_ifaces: Optional[List[
         state_color = Colors.GREEN if traffic.is_up else Colors.RED
         speed_info = f" ({traffic.speed} Mbps)" if traffic.speed else ""
         
-        sys.stdout.write(f"\n{Colors.SEPIA}{iface:<12}{Colors.RESET} [{state_color}{traffic.state}{Colors.RESET}]{speed_info}\n")
-        sys.stdout.write(f"  RX: {Colors.GREEN}{monitor.format_bytes(traffic.rx_bytes):<12}{Colors.RESET} "
-              f"{Colors.GREY}({traffic.rx_packets} pkts, {traffic.rx_errs} errs, {traffic.rx_drop} drop){Colors.RESET}\n")
-        sys.stdout.write(f"  TX: {Colors.YELLOW}{monitor.format_bytes(traffic.tx_bytes):<12}{Colors.RESET} "
-              f"{Colors.GREY}({traffic.tx_packets} pkts, {traffic.tx_errs} errs, {traffic.tx_drop} drop){Colors.RESET}\n")
+        output_lines.append(f"\n{Colors.SEPIA}{iface:<12}{Colors.RESET} [{state_color}{traffic.state}{Colors.RESET}]{speed_info}")
+        output_lines.append(f"  RX: {Colors.GREEN}{monitor.format_bytes(traffic.rx_bytes):<12}{Colors.RESET} "
+              f"{Colors.GREY}({traffic.rx_packets} pkts, {traffic.rx_errs} errs, {traffic.rx_drop} drop){Colors.RESET}")
+        output_lines.append(f"  TX: {Colors.YELLOW}{monitor.format_bytes(traffic.tx_bytes):<12}{Colors.RESET} "
+              f"{Colors.GREY}({traffic.tx_packets} pkts, {traffic.tx_errs} errs, {traffic.tx_drop} drop){Colors.RESET}")
         
         if traffic.is_active:
             total = monitor.format_bytes(traffic.total_bytes)
-            sys.stdout.write(f"  Total: {Colors.CYAN}{total}{Colors.RESET} "
-                  f"({traffic.total_packets} total packets)\n")
+            output_lines.append(f"  Total: {Colors.CYAN}{total}{Colors.RESET} "
+                  f"({traffic.total_packets} total packets)")
     
+    sys.stdout.write("\n".join(output_lines) + "\n")
     sys.stdout.flush()
 
 def clear_screen() -> None:
@@ -881,9 +891,10 @@ def watch_mode_improved(monitor: NetworkMonitor, filter_ifaces: Optional[List[st
             clear_screen()
             current_time = time.monotonic()
             elapsed_total = current_time - start_time
+            output_lines = []
             
-            sys.stdout.write(f"{Colors.BLUE}Live Network Traffic Monitor{Colors.RESET}\n")
-            sys.stdout.write(f"{Colors.GREY}Interval: {interval}s | Uptime: {elapsed_total:.0f}s | Updates: {update_count}{Colors.RESET}\n\n")
+            output_lines.append(f"{Colors.BLUE}Live Network Traffic Monitor{Colors.RESET}")
+            output_lines.append(f"{Colors.GREY}Interval: {interval}s | Uptime: {elapsed_total:.0f}s | Updates: {update_count}{Colors.RESET}\n")
             
             curr_stats = parse_proc_net_dev(monitor, filter_ifaces, include_static=False)
             
@@ -936,10 +947,10 @@ def watch_mode_improved(monitor: NetworkMonitor, filter_ifaces: Optional[List[st
                 if len(line) > terminal_width:
                     line = line[:terminal_width-3] + "..."
                 
-                sys.stdout.write(line + "\n")
+                output_lines.append(line)
             
             if not curr_stats:
-                sys.stdout.write(f"{Colors.GREY}No active interfaces to monitor.{Colors.RESET}\n")
+                output_lines.append(f"{Colors.GREY}No active interfaces to monitor.{Colors.RESET}")
             
             active_count = sum(1 for traffic in curr_stats.values() if traffic.is_active)
             total_rx = sum(t.rx_bytes for t in curr_stats.values())
@@ -950,7 +961,8 @@ def watch_mode_improved(monitor: NetworkMonitor, filter_ifaces: Optional[List[st
                   f"Total: RX{monitor.format_bytes(total_rx)} TX{monitor.format_bytes(total_tx)} | " \
                   f"{time.strftime('%H:%M:%S')}{Colors.RESET}\n"
             
-            sys.stdout.write(footer)
+            output_lines.append(footer)
+            sys.stdout.write("\n".join(output_lines))
             sys.stdout.flush()
             prev_stats = curr_stats
             update_count += 1
