@@ -52,6 +52,8 @@ class MonitorConfig:
     counter_bits: int = 64
     units: DisplayUnits = DisplayUnits.BINARY
     show_processes: bool = False
+    json_output: bool = False
+    alert_threshold: Optional[float] = None
 
 class Colors:
     RESET = "\033[0m"
@@ -467,6 +469,9 @@ class NetworkMonitor:
     def _get_mtu_uncached(self, interface: str) -> Optional[int]:
         if not self.safe_interface_name(interface):
             return None
+        
+        if interface not in self.get_available_interfaces():
+            return None
             
         try:
             mtu_str = self._read_sysfs_file(interface, "mtu")
@@ -551,7 +556,12 @@ class NetworkMonitor:
                                 addr_parts = parts[1].split("/")
                                 if len(addr_parts) == 2:
                                     addr, prefix = addr_parts
-                                    scope = "global" if "scope global" in line else "link"
+                                    if "scope global" in line:
+                                        scope = "global"
+                                    elif "scope link" in line:
+                                        scope = "link"
+                                    else:
+                                        scope = "other"
                                     ipv6_map.setdefault(iface, []).append(f"{addr}/{prefix} ({scope})")
             except subprocess.TimeoutExpired:
                 if proc:
@@ -633,6 +643,12 @@ class NetworkMonitor:
 
     def update_rate_history(self, interface: str, rx_rate: float, tx_rate: float):
         with self._lock:
+            if len(self._rate_history) > MAX_CACHE_SIZE * 2:
+                oldest = sorted(self._rate_history.keys(), 
+                              key=lambda k: self._rate_history[k][-1][2] if self._rate_history[k] else 0)[:10]
+                for iface in oldest:
+                    del self._rate_history[iface]
+            
             if interface not in self._rate_history:
                 self._rate_history[interface] = []
             
@@ -687,6 +703,30 @@ class NetworkMonitor:
         rx_percent = (rx_rate * 8 / max_bps) * 100 if max_bps > 0 else 0.0
         tx_percent = (tx_rate * 8 / max_bps) * 100 if max_bps > 0 else 0.0
         return min(rx_percent, 100.0), min(tx_percent, 100.0)
+
+    def check_alert_threshold(self, rx_rate: float, tx_rate: float, interface: str) -> Optional[str]:
+        if not self.config.alert_threshold:
+            return None
+        threshold_bps = self.config.alert_threshold * 1_000_000
+        if rx_rate > threshold_bps or tx_rate > threshold_bps:
+            return f"ALERT: {interface} exceeded {self.config.alert_threshold} Mbps"
+        return None
+
+    def generate_sparkline(self, rates: List[float], max_width: int = 10) -> str:
+        if not rates:
+            return ""
+        spark_chars = ["▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"]
+        recent = rates[-max_width:]
+        if not recent:
+            return ""
+        max_rate = max(recent)
+        if max_rate == 0:
+            return "▁" * len(recent)
+        sparkline = ""
+        for rate in recent:
+            idx = int((rate / max_rate) * (len(spark_chars) - 1))
+            sparkline += spark_chars[idx]
+        return sparkline
 
     def get_network_processes(self) -> List[Dict]:
         if not psutil:
@@ -797,7 +837,27 @@ def parse_proc_net_dev(monitor: NetworkMonitor, filter_ifaces: Optional[List[str
             
     return stats
 
+def output_json(data: Dict, monitor: NetworkMonitor) -> None:
+    json.dump(data, sys.stdout, indent=2)
+    sys.stdout.write("\n")
+    sys.stdout.flush()
+
 def display_network_info(monitor: NetworkMonitor, filter_ifaces: Optional[List[str]] = None) -> None:
+    if monitor.config.json_output:
+        output_data = {"interfaces": {}}
+        valid_ifaces = monitor.validate_interfaces(filter_ifaces)
+        for iface in valid_ifaces:
+            static_info = monitor.get_static_interface_info(iface)
+            output_data["interfaces"][iface] = {
+                "state": static_info.get('state', 'unknown'),
+                "mtu": static_info.get('mtu'),
+                "speed": static_info.get('speed'),
+                "duplex": static_info.get('duplex'),
+                "addresses": static_info.get('addrs', {'ipv4': [], 'ipv6': []})
+            }
+        output_json(output_data, monitor)
+        return
+        
     output_lines = [f"{Colors.BLUE}Network Interface Information:{Colors.RESET}"]
     valid_ifaces = monitor.validate_interfaces(filter_ifaces)
     
@@ -832,6 +892,24 @@ def display_network_info(monitor: NetworkMonitor, filter_ifaces: Optional[List[s
 
 def display_traffic_stats(monitor: NetworkMonitor, filter_ifaces: Optional[List[str]] = None) -> None:
     stats = parse_proc_net_dev(monitor, filter_ifaces)
+    
+    if monitor.config.json_output:
+        output_data = {"statistics": {}}
+        for iface, traffic in stats.items():
+            output_data["statistics"][iface] = {
+                "rx_bytes": traffic.rx_bytes,
+                "tx_bytes": traffic.tx_bytes,
+                "rx_packets": traffic.rx_packets,
+                "tx_packets": traffic.tx_packets,
+                "rx_errors": traffic.rx_errs,
+                "tx_errors": traffic.tx_errs,
+                "rx_drops": traffic.rx_drop,
+                "tx_drops": traffic.tx_drop,
+                "state": traffic.state
+            }
+        output_json(output_data, monitor)
+        return
+        
     output_lines = []
     
     if not stats:
@@ -893,16 +971,28 @@ def watch_mode_improved(monitor: NetworkMonitor, filter_ifaces: Optional[List[st
             elapsed_total = current_time - start_time
             output_lines = []
             
+            if monitor.config.json_output:
+                json_data = {
+                    "timestamp": time.time(),
+                    "uptime": elapsed_total,
+                    "interfaces": {}
+                }
+            
             output_lines.append(f"{Colors.BLUE}Live Network Traffic Monitor{Colors.RESET}")
             output_lines.append(f"{Colors.GREY}Interval: {interval}s | Uptime: {elapsed_total:.0f}s | Updates: {update_count}{Colors.RESET}\n")
             
             curr_stats = parse_proc_net_dev(monitor, filter_ifaces, include_static=False)
             
+            alerts = []
             for iface, now in curr_stats.items():
                 if iface in prev_stats:
                     old = prev_stats[iface]
                     rates = monitor.rate_calculator.calculate_all_rates(now, old, interval)
                     monitor.update_rate_history(iface, rates['rx_bytes_sec'], rates['tx_bytes_sec'])
+                    
+                    alert = monitor.check_alert_threshold(rates['rx_bytes_sec'], rates['tx_bytes_sec'], iface)
+                    if alert:
+                        alerts.append(alert)
             
             sorted_stats = sorted(curr_stats.items(), 
                 key=lambda x: (monitor.rate_calculator.calculate_rate(
@@ -913,6 +1003,26 @@ def watch_mode_improved(monitor: NetworkMonitor, filter_ifaces: Optional[List[st
                 reverse=True)
             
             for iface, now in sorted_stats:
+                if monitor.config.json_output:
+                    iface_data = {
+                        "rx_bytes": now.rx_bytes,
+                        "tx_bytes": now.tx_bytes,
+                        "state": now.state
+                    }
+                    
+                    if iface in prev_stats:
+                        rx_rate = monitor.rate_calculator.calculate_rate(now.rx_bytes, prev_stats[iface].rx_bytes, interval)
+                        tx_rate = monitor.rate_calculator.calculate_rate(now.tx_bytes, prev_stats[iface].tx_bytes, interval)
+                        avg_rx, avg_tx = monitor.get_avg_rates(iface)
+                        iface_data.update({
+                            "rx_rate": rx_rate,
+                            "tx_rate": tx_rate,
+                            "avg_rx_rate": avg_rx,
+                            "avg_tx_rate": avg_tx
+                        })
+                    
+                    json_data["interfaces"][iface] = iface_data
+                
                 state_color = Colors.GREEN if now.is_up else Colors.RED
                 
                 base_line = f"{Colors.SEPIA}{iface}{Colors.RESET} [{state_color}{now.state:<5}{Colors.RESET}]"
@@ -938,6 +1048,11 @@ def watch_mode_improved(monitor: NetworkMonitor, filter_ifaces: Optional[List[st
                     if rx_util > 0 or tx_util > 0:
                         util_color = Colors.RED if rx_util > 80 or tx_util > 80 else Colors.YELLOW
                         line_parts.append(f"{util_color}Util: {rx_util:.1f}%/{tx_util:.1f}%{Colors.RESET}")
+                    
+                    rx_rates = [r[0] for r in monitor._rate_history.get(iface, [])[-10:]]
+                    if rx_rates:
+                        sparkline = monitor.generate_sparkline(rx_rates)
+                        line_parts.append(f"{Colors.GREY}{sparkline}{Colors.RESET}")
                 else:
                     rx_str = f"RX: {Colors.GREEN}{monitor.format_bytes(now.rx_bytes)}{Colors.RESET}"
                     tx_str = f"TX: {Colors.YELLOW}{monitor.format_bytes(now.tx_bytes)}{Colors.RESET}"
@@ -951,6 +1066,17 @@ def watch_mode_improved(monitor: NetworkMonitor, filter_ifaces: Optional[List[st
             
             if not curr_stats:
                 output_lines.append(f"{Colors.GREY}No active interfaces to monitor.{Colors.RESET}")
+            
+            if alerts:
+                for alert in alerts:
+                    output_lines.append(f"{Colors.RED}{alert}{Colors.RESET}")
+            
+            if monitor.config.json_output:
+                output_json(json_data, monitor)
+                time.sleep(interval)
+                prev_stats = curr_stats
+                update_count += 1
+                continue
             
             active_count = sum(1 for traffic in curr_stats.values() if traffic.is_active)
             total_rx = sum(t.rx_bytes for t in curr_stats.values())
@@ -975,8 +1101,9 @@ def watch_mode_improved(monitor: NetworkMonitor, filter_ifaces: Optional[List[st
                 time.sleep(min(0.1, sleep_remaining))
                 sleep_remaining -= 0.1
     except KeyboardInterrupt:
-        sys.stdout.write(f"\n{Colors.GREY}Monitoring stopped.{Colors.RESET}\n")
-        sys.stdout.flush()
+        if not monitor.config.json_output:
+            sys.stdout.write(f"\n{Colors.GREY}Monitoring stopped.{Colors.RESET}\n")
+            sys.stdout.flush()
     finally:
         signal_handler.restore_handlers()
 
@@ -992,6 +1119,8 @@ def main():
     parser.add_argument("--units", choices=["binary", "decimal"], default="binary", help="Units for display")
     parser.add_argument("--precision", type=int, default=1, help="Decimal precision")
     parser.add_argument("--no-color", action="store_true", help="Disable colored output")
+    parser.add_argument("--json", action="store_true", help="Output in JSON format")
+    parser.add_argument("--alert-threshold", type=float, help="Alert when bandwidth exceeds threshold (Mbps)")
     
     args = parser.parse_args()
     
@@ -1009,7 +1138,9 @@ def main():
         show_loopback=not args.no_loopback,
         show_inactive=args.show_inactive,
         units=units_enum,
-        precision=args.precision
+        precision=args.precision,
+        json_output=args.json,
+        alert_threshold=args.alert_threshold
     )
     
     errors = validate_config(config)
