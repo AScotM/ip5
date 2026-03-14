@@ -1,7 +1,6 @@
 #!/usr/bin/env python3 -u
 
 import argparse
-import contextlib
 import fcntl
 import json
 import os
@@ -15,9 +14,8 @@ import threading
 import types
 from dataclasses import dataclass, field
 from enum import Enum
-from pathlib import Path
 from threading import RLock
-from typing import Dict, List, Optional, Tuple, Union, Callable, Any
+from typing import Dict, List, Optional, Tuple
 
 try:
     import psutil
@@ -192,8 +190,8 @@ def validate_config(config: MonitorConfig) -> List[str]:
         errors.append("Interval must be between 0.1 and 3600 seconds")
     if config.max_interfaces < 1 or config.max_interfaces > 1000:
         errors.append("Max interfaces must be between 1 and 1000")
-    if config.cache_ttl < 0:
-        errors.append("Cache TTL must be positive")
+    if config.cache_ttl <= 0:
+        errors.append("Cache TTL must be greater than 0")
     if config.units not in [DisplayUnits.BINARY, DisplayUnits.DECIMAL]:
         errors.append("Units must be 'binary' or 'decimal'")
     if config.counter_bits not in [32, 64]:
@@ -253,6 +251,11 @@ class NetworkMonitor:
         self._static_cache_time: float = 0
         self._static_cache_lock = threading.Lock()
         self._ip_binary_path = self._find_ip_binary()
+
+    def _log_debug(self, message: str) -> None:
+        if self.config.debug:
+            sys.stderr.write(f"Debug: {message}\n")
+            sys.stderr.flush()
 
     def _find_ip_binary(self) -> Optional[str]:
         for path in ['/sbin/ip', '/usr/sbin/ip', '/bin/ip', '/usr/bin/ip']:
@@ -373,8 +376,7 @@ class NetworkMonitor:
         except PermissionError:
             return None
         except (OSError, IOError, FileNotFoundError) as e:
-            if self.config.debug:
-                sys.stderr.write(f"Debug: Error reading {file_path}: {e}\n")
+            self._log_debug(f"Error reading {file_path}: {e}")
             raise
 
     def _read_interface_state(self, interface: str) -> str:
@@ -455,8 +457,7 @@ class NetworkMonitor:
                 self._interface_cache_time = now
                 return self._interface_cache[:]
         except (OSError, FileNotFoundError) as e:
-            if self.config.debug:
-                sys.stderr.write(f"Debug: Error getting interfaces: {e}\n")
+            self._log_debug(f"Error getting interfaces: {e}")
             return self._interface_cache[:] if self._interface_cache else []
 
     def validate_interfaces(self, requested_ifaces: Optional[List[str]]) -> List[str]:
@@ -495,8 +496,7 @@ class NetworkMonitor:
                 mtu_data = fcntl.ioctl(s.fileno(), 0x8921, ifr)
                 return struct.unpack('16sI', mtu_data)[1]
         except (OSError, struct.error, IndexError, ValueError, socket.timeout) as e:
-            if self.config.debug:
-                sys.stderr.write(f"Debug: MTU fetch failed for {interface}: {e}\n")
+            self._log_debug(f"MTU fetch failed for {interface}: {e}")
             return None
 
     def get_mtu_cached(self, interface: str) -> Optional[int]:
@@ -531,8 +531,7 @@ class NetworkMonitor:
                     return None
                 
         except Exception as e:
-            if self.config.debug:
-                sys.stderr.write(f"Debug: IPv4 fetch failed for {interface}: {e}\n")
+            self._log_debug(f"IPv4 fetch failed for {interface}: {e}")
             return None
 
     def _get_all_ipv6_info_uncached(self) -> Dict[str, List[str]]:
@@ -581,8 +580,7 @@ class NetworkMonitor:
                     proc.kill()
                     stdout, _ = proc.communicate()
         except (FileNotFoundError, subprocess.SubprocessError, OSError) as e:
-            if self.config.debug:
-                sys.stderr.write(f"Debug: IPv6 fetch failed: {e}\n")
+            self._log_debug(f"IPv6 fetch failed: {e}")
         finally:
             if proc and proc.poll() is None:
                 proc.kill()
@@ -703,6 +701,10 @@ class NetworkMonitor:
                 if not self._rate_history[iface]:
                     del self._rate_history[iface]
 
+    def get_recent_rx_rates(self, interface: str, limit: int = 10) -> List[float]:
+        with self._lock:
+            return [r[0] for r in self._rate_history.get(interface, [])[-limit:]]
+
     def get_avg_rates(self, interface: str) -> Tuple[float, float]:
         with self._lock:
             if interface not in self._rate_history or not self._rate_history[interface]:
@@ -753,28 +755,25 @@ class NetworkMonitor:
 
     def get_network_processes(self) -> List[Dict]:
         if not psutil:
-            if self.config.debug:
-                sys.stderr.write("psutil not available, process monitoring disabled\n")
+            self._log_debug("psutil not available, process monitoring disabled")
             return []
         try:
             network_processes = []
-            for proc in psutil.process_iter(['pid', 'name', 'connections']):
+            for proc in psutil.process_iter(['pid', 'name']):
                 try:
-                    connections = proc.info['connections']
+                    connections = proc.connections()
                     if connections:
                         network_processes.append({
                             'pid': proc.info['pid'],
                             'name': proc.info['name'],
                             'connections': len(connections)
                         })
-                except (psutil.NoSuchProcess, psutil.AccessDenied, KeyError, TypeError) as e:
-                    if self.config.debug:
-                        sys.stderr.write(f"Debug: Error getting process info: {e}\n")
+                except (psutil.NoSuchProcess, psutil.AccessDenied, TypeError) as e:
+                    self._log_debug(f"Error getting process info: {e}")
                     continue
             return sorted(network_processes, key=lambda x: x['connections'], reverse=True)[:10]
         except Exception as e:
-            if self.config.debug:
-                sys.stderr.write(f"Debug: Error in process monitoring: {e}\n")
+            self._log_debug(f"Error in process monitoring: {e}")
             return []
 
 def read_proc_net_dev_safe(max_lines: int = 1000) -> List[str]:
@@ -788,7 +787,7 @@ def read_proc_net_dev_safe(max_lines: int = 1000) -> List[str]:
             for i, line in enumerate(f):
                 if i >= max_lines:
                     break
-                if line.strip() and not line.startswith('Inter-face'):
+                if line.strip():
                     lines.append(line.strip())
     except (OSError, IOError, FileNotFoundError):
         pass
@@ -804,6 +803,9 @@ def parse_proc_net_dev(monitor: NetworkMonitor, filter_ifaces: Optional[List[str
     valid_ifaces = monitor.validate_interfaces(filter_ifaces)
     
     for line in lines:
+        if line.startswith('Inter-'):
+            continue
+            
         parts = line.split()
         if len(parts) < 17:
             continue
@@ -1078,7 +1080,7 @@ def watch_mode_improved(monitor: NetworkMonitor, filter_ifaces: Optional[List[st
                         util_color = Colors.RED if rx_util > 80 or tx_util > 80 else Colors.YELLOW
                         line_parts.append(f"{util_color}Util: {rx_util:.1f}%/{tx_util:.1f}%{Colors.RESET}")
                     
-                    rx_rates = [r[0] for r in monitor._rate_history.get(iface, [])[-10:]]
+                    rx_rates = monitor.get_recent_rx_rates(iface, 10)
                     if rx_rates:
                         sparkline = monitor.generate_sparkline(rx_rates)
                         line_parts.append(f"{Colors.GREY}{sparkline}{Colors.RESET}")
@@ -1127,8 +1129,9 @@ def watch_mode_improved(monitor: NetworkMonitor, filter_ifaces: Optional[List[st
             
             sleep_remaining = interval
             while sleep_remaining > 0 and not signal_handler.should_shutdown():
-                time.sleep(min(0.1, sleep_remaining))
-                sleep_remaining -= 0.1
+                chunk = min(0.1, sleep_remaining)
+                time.sleep(chunk)
+                sleep_remaining -= chunk
     except KeyboardInterrupt:
         if not monitor.config.json_output:
             sys.stdout.write(f"\n{Colors.GREY}Monitoring stopped.{Colors.RESET}\n")
