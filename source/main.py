@@ -54,6 +54,7 @@ class MonitorConfig:
     show_processes: bool = False
     json_output: bool = False
     alert_threshold: Optional[float] = None
+    debug: bool = False
 
 class Colors:
     RESET = "\033[0m"
@@ -199,6 +200,8 @@ def validate_config(config: MonitorConfig) -> List[str]:
         errors.append("Counter bits must be 32 or 64")
     if config.precision < 0 or config.precision > 6:
         errors.append("Precision must be between 0 and 6")
+    if config.alert_threshold is not None and config.alert_threshold <= 0:
+        errors.append("Alert threshold must be positive")
     return errors
 
 class LRUCache:
@@ -369,7 +372,9 @@ class NetworkMonitor:
                 return content.strip()
         except PermissionError:
             return None
-        except (OSError, IOError, FileNotFoundError):
+        except (OSError, IOError, FileNotFoundError) as e:
+            if self.config.debug:
+                sys.stderr.write(f"Debug: Error reading {file_path}: {e}\n")
             raise
 
     def _read_interface_state(self, interface: str) -> str:
@@ -449,7 +454,9 @@ class NetworkMonitor:
                 self._interface_cache = sorted(interfaces)
                 self._interface_cache_time = now
                 return self._interface_cache[:]
-        except (OSError, FileNotFoundError):
+        except (OSError, FileNotFoundError) as e:
+            if self.config.debug:
+                sys.stderr.write(f"Debug: Error getting interfaces: {e}\n")
             return self._interface_cache[:] if self._interface_cache else []
 
     def validate_interfaces(self, requested_ifaces: Optional[List[str]]) -> List[str]:
@@ -482,11 +489,14 @@ class NetworkMonitor:
 
         try:
             with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+                s.settimeout(1.0)
                 name_bytes = interface.encode('utf-8')[:15].ljust(15, b'\0')
                 ifr = struct.pack('16sI', name_bytes, 0)
                 mtu_data = fcntl.ioctl(s.fileno(), 0x8921, ifr)
                 return struct.unpack('16sI', mtu_data)[1]
-        except (OSError, struct.error, IndexError):
+        except (OSError, struct.error, IndexError, ValueError, socket.timeout) as e:
+            if self.config.debug:
+                sys.stderr.write(f"Debug: MTU fetch failed for {interface}: {e}\n")
             return None
 
     def get_mtu_cached(self, interface: str) -> Optional[int]:
@@ -504,6 +514,7 @@ class NetworkMonitor:
             
         try:
             with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+                s.settimeout(1.0)
                 name_bytes = interface.encode('utf-8')[:15].ljust(15, b'\0')
                 ifr = struct.pack('16s', name_bytes)
                 
@@ -519,7 +530,9 @@ class NetworkMonitor:
                 except OSError:
                     return None
                 
-        except Exception:
+        except Exception as e:
+            if self.config.debug:
+                sys.stderr.write(f"Debug: IPv4 fetch failed for {interface}: {e}\n")
             return None
 
     def _get_all_ipv6_info_uncached(self) -> Dict[str, List[str]]:
@@ -567,8 +580,9 @@ class NetworkMonitor:
                 if proc:
                     proc.kill()
                     stdout, _ = proc.communicate()
-        except (FileNotFoundError, subprocess.SubprocessError, OSError):
-            pass
+        except (FileNotFoundError, subprocess.SubprocessError, OSError) as e:
+            if self.config.debug:
+                sys.stderr.write(f"Debug: IPv6 fetch failed: {e}\n")
         finally:
             if proc and proc.poll() is None:
                 proc.kill()
@@ -643,11 +657,19 @@ class NetworkMonitor:
 
     def update_rate_history(self, interface: str, rx_rate: float, tx_rate: float):
         with self._lock:
-            if len(self._rate_history) > MAX_CACHE_SIZE * 2:
-                oldest = sorted(self._rate_history.keys(), 
-                              key=lambda k: self._rate_history[k][-1][2] if self._rate_history[k] else 0)[:10]
+            total_entries = sum(len(entries) for entries in self._rate_history.values())
+            if total_entries > MAX_CACHE_SIZE * 2:
+                all_entries = []
+                for iface, entries in self._rate_history.items():
+                    for entry in entries:
+                        all_entries.append((iface, entry[2]))
+                
+                all_entries.sort(key=lambda x: x[1])
+                to_remove = int(len(all_entries) * 0.1)
+                oldest = set(entry[0] for entry in all_entries[:to_remove])
                 for iface in oldest:
-                    del self._rate_history[iface]
+                    if iface in self._rate_history and self._rate_history[iface]:
+                        self._rate_history[iface].pop(0)
             
             if interface not in self._rate_history:
                 self._rate_history[interface] = []
@@ -725,11 +747,14 @@ class NetworkMonitor:
         sparkline = ""
         for rate in recent:
             idx = int((rate / max_rate) * (len(spark_chars) - 1))
+            idx = min(idx, len(spark_chars) - 1)
             sparkline += spark_chars[idx]
         return sparkline
 
     def get_network_processes(self) -> List[Dict]:
         if not psutil:
+            if self.config.debug:
+                sys.stderr.write("psutil not available, process monitoring disabled\n")
             return []
         try:
             network_processes = []
@@ -742,10 +767,14 @@ class NetworkMonitor:
                             'name': proc.info['name'],
                             'connections': len(connections)
                         })
-                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                except (psutil.NoSuchProcess, psutil.AccessDenied, KeyError, TypeError) as e:
+                    if self.config.debug:
+                        sys.stderr.write(f"Debug: Error getting process info: {e}\n")
                     continue
             return sorted(network_processes, key=lambda x: x['connections'], reverse=True)[:10]
-        except Exception:
+        except Exception as e:
+            if self.config.debug:
+                sys.stderr.write(f"Debug: Error in process monitoring: {e}\n")
             return []
 
 def read_proc_net_dev_safe(max_lines: int = 1000) -> List[str]:
@@ -1121,6 +1150,7 @@ def main():
     parser.add_argument("--no-color", action="store_true", help="Disable colored output")
     parser.add_argument("--json", action="store_true", help="Output in JSON format")
     parser.add_argument("--alert-threshold", type=float, help="Alert when bandwidth exceeds threshold (Mbps)")
+    parser.add_argument("--debug", action="store_true", help="Enable debug output")
     
     args = parser.parse_args()
     
@@ -1140,7 +1170,8 @@ def main():
         units=units_enum,
         precision=args.precision,
         json_output=args.json,
-        alert_threshold=args.alert_threshold
+        alert_threshold=args.alert_threshold,
+        debug=args.debug
     )
     
     errors = validate_config(config)
