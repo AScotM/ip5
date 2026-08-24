@@ -4,6 +4,7 @@ import argparse
 import fcntl
 import json
 import os
+import re
 import signal
 import socket
 import struct
@@ -12,16 +13,12 @@ import sys
 import time
 import threading
 import types
-from collections import deque, defaultdict
+from collections import OrderedDict, deque, defaultdict
 from dataclasses import dataclass, field
 from enum import Enum
 from threading import RLock
 from typing import Dict, List, Optional, Tuple, Any
 
-try:
-    import psutil
-except ImportError:
-    psutil = None
 
 PROC_NET_DEV = "/proc/net/dev"
 SYSFS_NET_PATH = "/sys/class/net"
@@ -38,6 +35,8 @@ DEFAULT_TIMEOUT = 1.0
 CACHE_TTL_DEFAULT = 60
 STATIC_CACHE_REFRESH_INTERVAL = 30
 MAX_REASONABLE_RATE = 100 * 1e9
+CACHE_MISS = object()
+ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 MAX_PROC_LINES = 1000
 SPARK_CHARS = ["\u2581", "\u2582", "\u2583", "\u2584", "\u2585", "\u2586", "\u2587", "\u2588"]
 IP_BINARY_PATHS = ['/sbin/ip', '/usr/sbin/ip', '/bin/ip', '/usr/bin/ip']
@@ -46,11 +45,6 @@ ALLOWED_SYSFS_FILES = [
     'tx_errors', 'rx_errors', 'tx_dropped', 'rx_dropped',
     'operstate', 'carrier', 'speed', 'mtu', 'duplex'
 ]
-
-class InterfaceState(Enum):
-    UP = "up"
-    DOWN = "down"
-    UNKNOWN = "unknown"
 
 class DisplayUnits(Enum):
     BINARY = "binary"
@@ -64,9 +58,7 @@ class MonitorConfig:
     show_loopback: bool = True
     show_inactive: bool = False
     precision: int = 1
-    counter_bits: int = 64
     units: DisplayUnits = DisplayUnits.BINARY
-    show_processes: bool = False
     json_output: bool = False
     alert_threshold: Optional[float] = None
     debug: bool = False
@@ -165,12 +157,9 @@ class RateCalculator:
             interval = 0.001
             
         try:
-            if current >= previous:
-                diff = current - previous
-            else:
-                max_count = 2**self.config.counter_bits - 1
-                diff = (max_count - previous) + current + 1
-            
+            if current < previous:
+                return 0.0
+            diff = current - previous
             rate = diff / interval
             return min(rate, MAX_REASONABLE_RATE)
         except (ZeroDivisionError, OverflowError):
@@ -184,25 +173,6 @@ class RateCalculator:
             'tx_packets_sec': self.calculate_rate(current.tx_packets, previous.tx_packets, interval),
         }
 
-def with_retry(max_attempts: int = 3, delay: float = 0.1):
-    def decorator(func):
-        def wrapper(*args, **kwargs):
-            last_exception = None
-            for attempt in range(max_attempts):
-                try:
-                    return func(*args, **kwargs)
-                except (OSError, IOError, FileNotFoundError) as e:
-                    if isinstance(e, PermissionError):
-                        raise
-                    last_exception = e
-                    if attempt < max_attempts - 1:
-                        time.sleep(delay * (2 ** attempt))
-            if last_exception:
-                raise last_exception
-            return None
-        return wrapper
-    return decorator
-
 def validate_config(config: MonitorConfig) -> List[str]:
     errors = []
     if config.interval < 0.1 or config.interval > 3600:
@@ -213,8 +183,6 @@ def validate_config(config: MonitorConfig) -> List[str]:
         errors.append("Cache TTL must be greater than 0")
     if config.units not in [DisplayUnits.BINARY, DisplayUnits.DECIMAL]:
         errors.append("Units must be 'binary' or 'decimal'")
-    if config.counter_bits not in [32, 64]:
-        errors.append("Counter bits must be 32 or 64")
     if config.precision < 0 or config.precision > 6:
         errors.append("Precision must be between 0 and 6")
     if config.alert_threshold is not None and config.alert_threshold <= 0:
@@ -223,39 +191,43 @@ def validate_config(config: MonitorConfig) -> List[str]:
 
 class LRUCache:
     def __init__(self, max_size: int = 1000, default_ttl: Optional[float] = None):
+        if max_size <= 0:
+            raise ValueError("max_size must be positive")
         self.max_size = max_size
         self.default_ttl = default_ttl
-        self.cache: Dict[str, Tuple[object, float]] = {}
+        self.cache: OrderedDict[str, Tuple[Any, float]] = OrderedDict()
         self._lock = threading.Lock()
-    
-    def get(self, key: str) -> Optional[object]:
+
+    def get(self, key: str) -> Any:
+        now = time.monotonic()
         with self._lock:
-            if key in self.cache:
-                value, timestamp = self.cache[key]
-                if self.default_ttl is not None:
-                    if time.time() - timestamp > self.default_ttl:
-                        del self.cache[key]
-                        return None
+            entry = self.cache.get(key, CACHE_MISS)
+            if entry is CACHE_MISS:
+                return CACHE_MISS
+            value, timestamp = entry
+            if self.default_ttl is not None and now - timestamp > self.default_ttl:
                 del self.cache[key]
-                self.cache[key] = (value, timestamp)
-                return value
-        return None
-    
-    def set(self, key: str, value: object, timestamp: Optional[float] = None):
+                return CACHE_MISS
+            self.cache.move_to_end(key)
+            return value
+
+    def set(self, key: str, value: Any, timestamp: Optional[float] = None) -> None:
         if timestamp is None:
-            timestamp = time.time()
+            timestamp = time.monotonic()
         with self._lock:
             if key in self.cache:
                 del self.cache[key]
-            elif len(self.cache) >= self.max_size:
-                oldest_key = next(iter(self.cache))
-                del self.cache[oldest_key]
             self.cache[key] = (value, timestamp)
-    
-    def cleanup_old(self, max_age: float):
-        cutoff = time.time() - max_age
+            self.cache.move_to_end(key)
+            while len(self.cache) > self.max_size:
+                self.cache.popitem(last=False)
+
+    def cleanup_old(self, max_age: float) -> None:
+        cutoff = time.monotonic() - max_age
         with self._lock:
-            self.cache = {k: v for k, v in self.cache.items() if v[1] >= cutoff}
+            stale_keys = [key for key, (_, timestamp) in self.cache.items() if timestamp < cutoff]
+            for key in stale_keys:
+                del self.cache[key]
 
 class NetworkMonitor:
     def __init__(self, config: MonitorConfig):
@@ -350,27 +322,24 @@ class NetworkMonitor:
 
     def validate_sysfs_path(self, file_path: str) -> bool:
         try:
-            resolved_path = os.path.realpath(file_path)
-            if not resolved_path.startswith(SYSFS_NET_PATH + '/'):
+            normalized_path = os.path.abspath(file_path)
+            if os.path.commonpath([normalized_path, SYSFS_NET_PATH]) != SYSFS_NET_PATH:
                 return False
-            
-            relative = os.path.relpath(resolved_path, SYSFS_NET_PATH)
-            if relative.startswith('..') or os.path.isabs(relative):
+
+            relative = os.path.relpath(normalized_path, SYSFS_NET_PATH)
+            if relative.startswith("..") or os.path.isabs(relative):
                 return False
-            
+
             path_parts = relative.split(os.sep)
-            if len(path_parts) < 1 or len(path_parts) > 2:
+            if len(path_parts) != 2:
                 return False
-            
-            iface_name = path_parts[0]
+
+            iface_name, filename = path_parts
             if not self.safe_interface_name(iface_name):
                 return False
-            
-            if len(path_parts) == 2:
-                filename = path_parts[1]
-                if filename not in ALLOWED_SYSFS_FILES:
-                    return False
-            
+            if filename not in ALLOWED_SYSFS_FILES:
+                return False
+
             return True
         except (ValueError, OSError):
             return False
@@ -408,7 +377,7 @@ class NetworkMonitor:
 
     def get_interface_state(self, interface: str) -> str:
         cached = self._state_cache.get(interface)
-        if cached is not None:
+        if cached is not CACHE_MISS:
             return cached
         
         state = self._read_interface_state(interface)
@@ -419,14 +388,15 @@ class NetworkMonitor:
         try:
             speed_str = self._read_sysfs_file(interface, "speed")
             if speed_str:
-                return int(speed_str)
+                speed = int(speed_str)
+                return speed if speed > 0 else None
         except (ValueError, OSError, IOError, FileNotFoundError):
             pass
         return None
 
     def get_interface_speed(self, interface: str) -> Optional[int]:
         cached = self._speed_cache.get(interface)
-        if cached is not None:
+        if cached is not CACHE_MISS:
             return cached
         
         speed = self._read_interface_speed(interface)
@@ -436,13 +406,16 @@ class NetworkMonitor:
     def _read_interface_duplex(self, interface: str) -> Optional[str]:
         try:
             duplex = self._read_sysfs_file(interface, "duplex")
-            return duplex.lower() if duplex else None
+            if not duplex:
+                return None
+            duplex = duplex.lower()
+            return duplex if duplex in {"full", "half"} else None
         except (OSError, IOError, FileNotFoundError):
             return None
 
     def get_interface_duplex(self, interface: str) -> Optional[str]:
         cached = self._duplex_cache.get(interface)
-        if cached is not None:
+        if cached is not CACHE_MISS:
             return cached
         
         duplex = self._read_interface_duplex(interface)
@@ -523,7 +496,7 @@ class NetworkMonitor:
 
     def get_mtu_cached(self, interface: str) -> Optional[int]:
         cached = self._mtu_cache.get(interface)
-        if cached is not None:
+        if cached is not CACHE_MISS:
             return cached
         
         mtu = self._get_mtu_uncached(interface)
@@ -619,7 +592,7 @@ class NetworkMonitor:
 
     def get_all_ipv6_info_cached(self) -> Dict[str, List[str]]:
         cached = self._ipv6_cache.get("all_ipv6_info")
-        if cached is not None:
+        if cached is not CACHE_MISS:
             return cached
         
         ipv6_map = self._get_all_ipv6_info_uncached()
@@ -753,8 +726,8 @@ class NetworkMonitor:
     def check_alert_threshold(self, rx_rate: float, tx_rate: float, interface: str) -> Optional[str]:
         if not self.config.alert_threshold:
             return None
-        threshold_bps = self.config.alert_threshold * 1_000_000
-        if rx_rate > threshold_bps or tx_rate > threshold_bps:
+        threshold_bytes_sec = self.config.alert_threshold * 1_000_000 / 8
+        if rx_rate > threshold_bytes_sec or tx_rate > threshold_bytes_sec:
             return f"ALERT: {interface} exceeded {self.config.alert_threshold} Mbps"
         return None
 
@@ -773,29 +746,6 @@ class NetworkMonitor:
             idx = min(idx, len(SPARK_CHARS) - 1)
             sparkline += SPARK_CHARS[idx]
         return sparkline
-
-    def get_network_processes(self) -> List[Dict]:
-        if not psutil:
-            self._log_debug("psutil not available, process monitoring disabled")
-            return []
-        try:
-            network_processes = []
-            for proc in psutil.process_iter(['pid', 'name']):
-                try:
-                    connections = proc.connections()
-                    if connections:
-                        network_processes.append({
-                            'pid': proc.info['pid'],
-                            'name': proc.info['name'],
-                            'connections': len(connections)
-                        })
-                except (psutil.NoSuchProcess, psutil.AccessDenied, TypeError) as e:
-                    self._log_debug(f"Error getting process info: {e}")
-                    continue
-            return sorted(network_processes, key=lambda x: x['connections'], reverse=True)[:10]
-        except Exception as e:
-            self._log_debug(f"Error in process monitoring: {e}")
-            return []
 
 def read_proc_net_dev_safe(max_lines: int = MAX_PROC_LINES) -> List[str]:
     lines = []
@@ -832,7 +782,7 @@ def parse_proc_net_dev(monitor: NetworkMonitor, filter_ifaces: Optional[List[str
             continue
             
         iface = parts[0].rstrip(":")
-        if valid_ifaces and iface not in valid_ifaces:
+        if filter_ifaces and iface not in valid_ifaces:
             continue
             
         try:
@@ -889,7 +839,7 @@ def parse_proc_net_dev(monitor: NetworkMonitor, filter_ifaces: Optional[List[str
             
     return stats
 
-def output_json(data: Dict, monitor: NetworkMonitor) -> None:
+def output_json(data: Dict) -> None:
     json.dump(data, sys.stdout, indent=2)
     sys.stdout.write("\n")
     sys.stdout.flush()
@@ -907,7 +857,7 @@ def display_network_info(monitor: NetworkMonitor, filter_ifaces: Optional[List[s
                 "duplex": static_info.get('duplex'),
                 "addresses": static_info.get('addrs', {'ipv4': [], 'ipv6': []})
             }
-        output_json(output_data, monitor)
+        output_json(output_data)
         return
         
     blue = Colors.get(Colors.BLUE)
@@ -966,7 +916,7 @@ def display_traffic_stats(monitor: NetworkMonitor, filter_ifaces: Optional[List[
                 "tx_drops": traffic.tx_drop,
                 "state": traffic.state
             }
-        output_json(output_data, monitor)
+        output_json(output_data)
         return
     
     blue = Colors.get(Colors.BLUE)
@@ -1008,6 +958,46 @@ def display_traffic_stats(monitor: NetworkMonitor, filter_ifaces: Optional[List[
     sys.stdout.write("\n".join(output_lines) + "\n")
     sys.stdout.flush()
 
+def truncate_ansi(text: str, width: int) -> str:
+    if width <= 0:
+        return ""
+    plain = ANSI_ESCAPE_RE.sub("", text)
+    if len(plain) <= width:
+        return text
+    if width <= 3:
+        return plain[:width]
+
+    target = width - 3
+    output = []
+    visible = 0
+    position = 0
+
+    for match in ANSI_ESCAPE_RE.finditer(text):
+        segment = text[position:match.start()]
+        remaining = target - visible
+        if remaining <= 0:
+            break
+        if len(segment) > remaining:
+            output.append(segment[:remaining])
+            visible += remaining
+            position = match.start()
+            break
+        output.append(segment)
+        visible += len(segment)
+        output.append(match.group())
+        position = match.end()
+
+    if visible < target:
+        segment = text[position:]
+        remaining = target - visible
+        output.append(segment[:remaining])
+
+    output.append("...")
+    reset = Colors.get(Colors.RESET)
+    if reset:
+        output.append(reset)
+    return "".join(output)
+
 def clear_screen() -> None:
     if os.name == 'posix':
         sys.stdout.write("\033[H\033[J")
@@ -1022,14 +1012,17 @@ def sleep_interval(interval: float, signal_handler: SignalHandler) -> None:
         time.sleep(chunk)
         sleep_remaining -= chunk
 
-def collect_json_data(monitor: NetworkMonitor, filter_ifaces: Optional[List[str]], interval: float, prev_stats: Dict[str, InterfaceTraffic]) -> Dict[str, Any]:
+def collect_json_data(
+    monitor: NetworkMonitor,
+    curr_stats: Dict[str, InterfaceTraffic],
+    prev_stats: Dict[str, InterfaceTraffic],
+    sample_interval: Optional[float]
+) -> Dict[str, Any]:
     json_data = {
         "timestamp": time.time(),
         "interfaces": {}
     }
-    
-    curr_stats = parse_proc_net_dev(monitor, filter_ifaces, include_static=False)
-    
+
     for iface, now in curr_stats.items():
         iface_data = {
             "rx_bytes": now.rx_bytes,
@@ -1043,22 +1036,35 @@ def collect_json_data(monitor: NetworkMonitor, filter_ifaces: Optional[List[str]
             "state": now.state,
             "speed": now.speed,
             "duplex": now.duplex,
-            "mtu": now.mtu
+            "mtu": now.mtu,
+            "ipv4_addr": now.ipv4_addr,
+            "ipv6_addrs": now.ipv6_addrs
         }
-        
-        if iface in prev_stats:
-            rx_rate = monitor.rate_calculator.calculate_rate(now.rx_bytes, prev_stats[iface].rx_bytes, interval)
-            tx_rate = monitor.rate_calculator.calculate_rate(now.tx_bytes, prev_stats[iface].tx_bytes, interval)
+
+        if sample_interval is not None and iface in prev_stats:
+            rates = monitor.rate_calculator.calculate_all_rates(
+                now, prev_stats[iface], sample_interval
+            )
+            monitor.update_rate_history(
+                iface, rates["rx_bytes_sec"], rates["tx_bytes_sec"]
+            )
             avg_rx, avg_tx = monitor.get_avg_rates(iface)
+            rx_util, tx_util = monitor.calculate_utilization_percentage(
+                iface, rates["rx_bytes_sec"], rates["tx_bytes_sec"]
+            )
             iface_data.update({
-                "rx_rate": rx_rate,
-                "tx_rate": tx_rate,
+                "rx_rate": rates["rx_bytes_sec"],
+                "tx_rate": rates["tx_bytes_sec"],
+                "rx_packets_rate": rates["rx_packets_sec"],
+                "tx_packets_rate": rates["tx_packets_sec"],
                 "avg_rx_rate": avg_rx,
-                "avg_tx_rate": avg_tx
+                "avg_tx_rate": avg_tx,
+                "rx_utilization_percent": rx_util,
+                "tx_utilization_percent": tx_util
             })
-        
+
         json_data["interfaces"][iface] = iface_data
-    
+
     return json_data
 
 def watch_mode_improved(monitor: NetworkMonitor, filter_ifaces: Optional[List[str]], interval: float) -> None:
@@ -1068,36 +1074,53 @@ def watch_mode_improved(monitor: NetworkMonitor, filter_ifaces: Optional[List[st
         sys.stderr.write(f"{red}Interval too small: {interval}s{reset}\n")
         sys.stderr.flush()
         return
-        
+
     prev_stats: Dict[str, InterfaceTraffic] = {}
+    prev_sample_time: Optional[float] = None
     start_time = time.monotonic()
     update_count = 0
     signal_handler = SignalHandler()
-    
+
     terminal_width = 80
     try:
         terminal_width = os.get_terminal_size().columns
     except OSError:
         pass
-    
+
     try:
-        if monitor.config.json_output:
-            while not signal_handler.should_shutdown():
-                json_data = collect_json_data(monitor, filter_ifaces, interval, prev_stats)
-                json_data["uptime"] = time.monotonic() - start_time
-                json_data["update_count"] = update_count
-                output_json(json_data, monitor)
-                prev_stats = parse_proc_net_dev(monitor, filter_ifaces, include_static=False)
-                update_count += 1
-                sleep_interval(interval, signal_handler)
-            return
-        
         while not signal_handler.should_shutdown():
+            sample_time = time.monotonic()
+            sample_interval = (
+                sample_time - prev_sample_time
+                if prev_sample_time is not None
+                else None
+            )
+            curr_stats = parse_proc_net_dev(
+                monitor, filter_ifaces, include_static=True
+            )
+
+            if monitor.config.json_output:
+                json_data = collect_json_data(
+                    monitor, curr_stats, prev_stats, sample_interval
+                )
+                json_data["uptime"] = sample_time - start_time
+                json_data["update_count"] = update_count
+                json_data["sample_interval"] = sample_interval
+                output_json(json_data)
+                prev_stats = curr_stats
+                prev_sample_time = sample_time
+                update_count += 1
+
+                if update_count % 10 == 0:
+                    monitor.cleanup_old_history()
+
+                sleep_interval(interval, signal_handler)
+                continue
+
             clear_screen()
-            current_time = time.monotonic()
-            elapsed_total = current_time - start_time
+            elapsed_total = sample_time - start_time
             output_lines = []
-            
+
             blue = Colors.get(Colors.BLUE)
             grey = Colors.get(Colors.GREY)
             sepia = Colors.get(Colors.SEPIA)
@@ -1106,58 +1129,80 @@ def watch_mode_improved(monitor: NetworkMonitor, filter_ifaces: Optional[List[st
             cyan = Colors.get(Colors.CYAN)
             red = Colors.get(Colors.RED)
             reset = Colors.get(Colors.RESET)
-            
+
             output_lines.append(f"{blue}Live Network Traffic Monitor{reset}")
-            output_lines.append(f"{grey}Interval: {interval}s | Uptime: {elapsed_total:.0f}s | Updates: {update_count}{reset}\n")
-            
-            curr_stats = parse_proc_net_dev(monitor, filter_ifaces, include_static=False)
-            
+            interval_display = (
+                f"{sample_interval:.3f}s"
+                if sample_interval is not None
+                else "initial"
+            )
+            output_lines.append(
+                f"{grey}Configured interval: {interval}s | "
+                f"Sample: {interval_display} | Uptime: {elapsed_total:.0f}s | "
+                f"Updates: {update_count}{reset}\n"
+            )
+
+            rates_by_iface: Dict[str, Dict[str, float]] = {}
             alerts = []
-            for iface, now in curr_stats.items():
-                if iface in prev_stats:
-                    old = prev_stats[iface]
-                    rates = monitor.rate_calculator.calculate_all_rates(now, old, interval)
-                    monitor.update_rate_history(iface, rates['rx_bytes_sec'], rates['tx_bytes_sec'])
-                    
-                    alert = monitor.check_alert_threshold(rates['rx_bytes_sec'], rates['tx_bytes_sec'], iface)
+
+            if sample_interval is not None:
+                for iface, now in curr_stats.items():
+                    if iface not in prev_stats:
+                        continue
+                    rates = monitor.rate_calculator.calculate_all_rates(
+                        now, prev_stats[iface], sample_interval
+                    )
+                    rates_by_iface[iface] = rates
+                    monitor.update_rate_history(
+                        iface, rates["rx_bytes_sec"], rates["tx_bytes_sec"]
+                    )
+                    alert = monitor.check_alert_threshold(
+                        rates["rx_bytes_sec"], rates["tx_bytes_sec"], iface
+                    )
                     if alert:
                         alerts.append(alert)
-            
-            sorted_stats = sorted(curr_stats.items(), 
-                key=lambda x: (monitor.rate_calculator.calculate_rate(
-                    x[1].rx_bytes, 
-                    prev_stats[x[0]].rx_bytes if x[0] in prev_stats else 0, 
-                    interval
-                ) if x[0] in prev_stats else 0, x[0]), 
-                reverse=True)
-            
+
+            sorted_stats = sorted(
+                curr_stats.items(),
+                key=lambda item: (
+                    rates_by_iface.get(item[0], {}).get("rx_bytes_sec", 0.0),
+                    item[0]
+                ),
+                reverse=True
+            )
+
             for iface, now in sorted_stats:
                 state_color = green if now.is_up else red
-                
-                base_line = f"{sepia}{iface}{reset} [{state_color}{now.state:<5}{reset}]"
-                
-                if len(base_line) > terminal_width:
-                    base_line = base_line[:terminal_width-3] + "..."
-                
+                base_line = (
+                    f"{sepia}{iface}{reset} "
+                    f"[{state_color}{now.state:<5}{reset}]"
+                )
+                base_line = truncate_ansi(base_line, terminal_width)
                 line_parts = [base_line]
-                
-                if iface in prev_stats:
-                    rx_rate = monitor.rate_calculator.calculate_rate(now.rx_bytes, prev_stats[iface].rx_bytes, interval)
-                    tx_rate = monitor.rate_calculator.calculate_rate(now.tx_bytes, prev_stats[iface].tx_bytes, interval)
+
+                rates = rates_by_iface.get(iface)
+                if rates is not None:
+                    rx_rate = rates["rx_bytes_sec"]
+                    tx_rate = rates["tx_bytes_sec"]
                     avg_rx, avg_tx = monitor.get_avg_rates(iface)
-                    
-                    rx_util, tx_util = monitor.calculate_utilization_percentage(iface, rx_rate, tx_rate)
-                    
+                    rx_util, tx_util = monitor.calculate_utilization_percentage(
+                        iface, rx_rate, tx_rate
+                    )
+
                     rx_str = f"RX: {green}{monitor.format_rate(rx_rate)}{reset}"
                     tx_str = f"TX: {yellow}{monitor.format_rate(tx_rate)}{reset}"
-                    avg_str = f"Avg: {cyan}{monitor.format_rate(avg_rx)}/{monitor.format_rate(avg_tx)}{reset}"
-                    
+                    avg_str = (
+                        f"Avg: {cyan}{monitor.format_rate(avg_rx)}/"
+                        f"{monitor.format_rate(avg_tx)}{reset}"
+                    )
                     line_parts.extend([rx_str, tx_str, avg_str])
-                    
+
                     if rx_util > 0 or tx_util > 0:
                         util_color = red if rx_util > 80 or tx_util > 80 else yellow
-                        line_parts.append(f"{util_color}Util: {rx_util:.1f}%/{tx_util:.1f}%{reset}")
-                    
+                        line_parts.append(
+                            f"{util_color}Util: {rx_util:.1f}%/{tx_util:.1f}%{reset}"
+                        )
+
                     rx_rates = monitor.get_recent_rx_rates(iface, 10)
                     if rx_rates:
                         sparkline = monitor.generate_sparkline(rx_rates)
@@ -1166,40 +1211,42 @@ def watch_mode_improved(monitor: NetworkMonitor, filter_ifaces: Optional[List[st
                     rx_str = f"RX: {green}{monitor.format_bytes(now.rx_bytes)}{reset}"
                     tx_str = f"TX: {yellow}{monitor.format_bytes(now.tx_bytes)}{reset}"
                     line_parts.extend([rx_str, tx_str, f"{grey}(initial){reset}"])
-                
-                line = " ".join(line_parts)
-                if len(line) > terminal_width:
-                    line = line[:terminal_width-3] + "..."
-                
+
+                line = truncate_ansi(" ".join(line_parts), terminal_width)
                 output_lines.append(line)
-            
+
             if not curr_stats:
                 output_lines.append(f"{grey}No active interfaces to monitor.{reset}")
-            
-            if alerts:
-                for alert in alerts:
-                    output_lines.append(f"{red}{alert}{reset}")
-            
-            active_count = sum(1 for traffic in curr_stats.values() if traffic.is_active)
+
+            for alert in alerts:
+                output_lines.append(f"{red}{alert}{reset}")
+
+            active_count = sum(
+                1 for traffic in curr_stats.values() if traffic.is_active
+            )
             total_rx = sum(t.rx_bytes for t in curr_stats.values())
             total_tx = sum(t.tx_bytes for t in curr_stats.values())
-            
-            footer = f"\n{grey}[Ctrl+C to stop] | " \
-                  f"Interfaces: {len(curr_stats)} (active: {active_count}) | " \
-                  f"Total: RX{monitor.format_bytes(total_rx)} TX{monitor.format_bytes(total_tx)} | " \
-                  f"{time.strftime('%H:%M:%S')}{reset}\n"
-            
+
+            footer = (
+                f"\n{grey}[Ctrl+C to stop] | "
+                f"Interfaces: {len(curr_stats)} (active: {active_count}) | "
+                f"Total: RX{monitor.format_bytes(total_rx)} "
+                f"TX{monitor.format_bytes(total_tx)} | "
+                f"{time.strftime('%H:%M:%S')}{reset}\n"
+            )
             output_lines.append(footer)
             sys.stdout.write("\n".join(output_lines))
             sys.stdout.flush()
+
             prev_stats = curr_stats
+            prev_sample_time = sample_time
             update_count += 1
-            
+
             if update_count % 10 == 0:
                 monitor.cleanup_old_history()
-            
+
             sleep_interval(interval, signal_handler)
-            
+
     except KeyboardInterrupt:
         if not monitor.config.json_output:
             grey = Colors.get(Colors.GREY)
